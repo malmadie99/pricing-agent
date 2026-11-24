@@ -37,7 +37,7 @@ SYSTEM_PROMPT = """أنت وكيل تسعير لمحمد، ساكن في الخ�
 مهمتك: من نتائج البحث المرفقة فقط، اجمع كل صفحات المنتجات المرشحة (لين MAX_OPTIONS). فيه مرحلة تحقق بعدك تراجع السعر والتوفر والمطابقة، فلا تكون متشدد زيادة:
 - أي نتيجة تبدو صفحة منتج للجهاز المطلوب وفيها سعر (في page أو content) ضيفها.
 - استبعد بس: المقالات والأدلة وصفحات الأقسام، والمزادات، واللي مكتوب صراحة إنه نافد، وقطع الغيار والمستهلكات لحالها (إلا إذا طلبها المستخدم).
-- خذ السعر من page إذا موجود، وإلا من content. ممنوع تختلق سعر أو رابط.
+- خذ السعر من page إذا موجود، وإلا من content. ممنوع تختلق سعر أو رابط، وممنوع الأسعار التقديرية: إذا الرقم مو مكتوب في النتيجة لا تحط المنتج.
 - لا تكرر نفس الرابط.
 
 حاول توصل MAX_OPTIONS خيار. قدّم المطابقة للميزانية، وإذا ما كفت كمّل بأقرب خيارات فوقها واكتب في price_note "فوق الميزانية".
@@ -239,9 +239,9 @@ def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) ->
         url = GEMINI_URL.format(model=model)
         started = time.time()
         for attempt in range(3):
-            r = requests.post(url, headers=headers, json=body, timeout=120)
-            if r.status_code in (500, 502, 503, 504) and attempt < 2:
-                time.sleep(10 * (attempt + 1))  # ضغط مؤقت على النموذج، ننتظر ونعيد
+            r = requests.post(url, headers=headers, json=body, timeout=90)
+            if r.status_code in (500, 502, 503, 504) and attempt < 1:
+                time.sleep(5)  # ضغط مؤقت: محاولة وحدة سريعة وبعدها ننتقل للنموذج اللي بعده
                 continue
             if r.status_code == 429 and "PerDay" not in r.text and attempt < 2:
                 time.sleep(20)  # حد الدقيقة، مو حد اليوم
@@ -295,7 +295,7 @@ def tavily_extract(urls: list) -> dict:
     return pages
 
 
-def price_snippets(text: str, head: int = 600, window: int = 220, max_hits: int = 8) -> str:
+def price_snippets(text: str, head: int = 500, window: int = 180, max_hits: int = 6) -> str:
     """بداية الصفحة (الاسم والمواصفات) + المقاطع اللي حول الأسعار فقط، عشان نوفر حجم الطلب."""
     text = re.sub(r"\s+", " ", text)
     parts = [text[:head]]
@@ -372,7 +372,7 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
                     "source": name,
                     "title": h.get("title", ""),
                     "url": url,
-                    "content": (h.get("content") or "")[:500],
+                    "content": (h.get("content") or "")[:400],
                 })
 
     # نوزّع بالتناوب بين المصادر عشان كل منصة يكون لها نصيب من الصفحات المفتوحة
@@ -403,7 +403,7 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
     print(f"pages={len(pages)} dropped={len(results) - len(kept)}")
     results = kept
 
-    system = SYSTEM_PROMPT.replace("MAX_OPTIONS", str(MAX_OPTIONS + 5))
+    system = SYSTEM_PROMPT.replace("MAX_OPTIONS", str(MAX_OPTIONS + 8))
     page_text = {r["url"]: r.get("page") or r.get("content", "") for r in results}
 
     # النموذج المجاني أحياناً يرجع خيارات قليلة، فنعيد على النتائج اللي ما استخدمها لين نكمل 7
@@ -412,7 +412,7 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
         remaining = [r for r in results if r["url"] not in used]
         if not remaining:
             break
-        sources = json.dumps(remaining[:70], ensure_ascii=False, indent=0)
+        sources = json.dumps(remaining[:50], ensure_ascii=False, indent=0)
         prompt = (
             f"تاريخ اليوم: {today}\n\nطلب الشراء:\n{request_text}\n\n"
             "نتائج البحث (استخدم هذه فقط، ولا تذكر رابط غير موجود فيها):\n" + sources
@@ -429,7 +429,7 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
         if len(verified) >= MAX_OPTIONS:
             break
         # الجولة الجاية: نستبعد النتائج اللي عُرضت عليه أول مرة ونعطيه البقية
-        used.update(r["url"] for r in remaining[:35])
+        used.update(r["url"] for r in remaining[:25])
 
     result = {"options": verified}
     return result
@@ -531,6 +531,15 @@ def fetch_structured(url: str) -> dict:
         return {}
 
 
+def price_in_text(price, text: str) -> bool:
+    """هل الرقم مكتوب فعلاً في نص الصفحة؟ (يمنع الأسعار التقديرية أو المختلقة)"""
+    if not isinstance(price, (int, float)) or not text:
+        return False
+    digits = re.sub(r"[,\u066c\s]", "", (text or "").translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")))
+    whole = str(int(price))
+    return re.search(rf"(?<!\d){whole}(?:\.\d+)?(?!\d)", digits) is not None
+
+
 def is_part(name: str, request_text: str) -> bool:
     name, req = (name or "").lower(), request_text.lower()
     return any(w in name and w not in req for w in PART_WORDS)
@@ -551,6 +560,8 @@ def verify_options(request_text, options, page_text, llm=gemini, fetch=None) -> 
     for o, sd in zip(options, structured):
         if sd.get("available") is False:
             continue  # نافد حسب الصفحة
+        if not sd.get("price") and not price_in_text(o.get("price_sar"), page_text.get(o.get("url"), "")):
+            continue  # سعر ما نقدر نتحقق منه ولا هو مكتوب في الصفحة = ممكن يكون تقدير، نستبعده
         if sd.get("price"):
             cur = sd.get("currency") or "SAR"
             rate = CURRENCY_TO_SAR.get(cur)

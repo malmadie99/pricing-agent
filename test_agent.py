@@ -122,8 +122,8 @@ def test_research_pipeline_dedup_and_prompt():
     result = agent.research("فلتر", llm=fake_llm, search=fake_search,
                             extract=lambda urls: {"https://noon.com": "فلتر جامبو كامل السعر 496 ر.س شامل الضريبة",
                                                   "https://ebay.com": "Jumbo filter Place bid now"},
-                            fetch=lambda u: {})
-    assert len(result["options"]) == 3
+                            fetch=lambda u: {"price": 100.0, "currency": "SAR"})
+    assert len(result["options"]) == 2  # C بدون رابط ولا سعر = ينحذف
     final_prompt = [p for p, s in calls if s][0]
     assert final_prompt.count("https://same") == 1 and "https://noon.com" in final_prompt
     assert "496 ر.س" in final_prompt
@@ -202,7 +202,7 @@ def test_verify_overrides_price_and_filters():
 
 
 def test_verify_converts_currency():
-    out = agent.verify_options("x", [{"name": "a", "url": "u"}], {},
+    out = agent.verify_options("x", [{"name": "a", "url": "u", "price_sar": 1}], {},
                                llm=lambda p, s="": '{"checks":[{"i":0,"complete":true,"matches":true}]}',
                                fetch=lambda u: {"price": 100.0, "currency": "USD"})
     assert out[0]["price_sar"] == 375.0 and "USD" in out[0]["price_note"]
@@ -495,3 +495,20 @@ def test_model_rank_prefers_new_lite_then_flash():
     assert sorted(names, key=agent._model_rank) == [
         "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
         "gemini-3.1-flash-lite-preview", "gemini-3.8-flash", "gemini-2.5-flash"]
+
+
+def test_price_in_text():
+    assert agent.price_in_text(496, "السعر ٤٩٦ ر.س شامل")
+    assert agent.price_in_text(1299, "SAR 1,299.00")
+    assert not agent.price_in_text(85, "سعر غير مذكور 850 ريال")
+    assert not agent.price_in_text(None, "85")
+
+
+def test_verify_drops_unverifiable_estimated_price():
+    opts = [{"name": "قناة U", "price_sar": 85, "url": "https://a"},
+            {"name": "قناة U ستانلس", "price_sar": 145.95, "url": "https://b"}]
+    pages = {"https://a": "Strut channel options", "https://b": "UPE channel SAR 145.95"}
+    out = agent.verify_options("قناة U", opts, pages,
+                               llm=lambda p, s="": '{"checks":[{"i":0,"complete":true,"matches":true}]}',
+                               fetch=lambda u: {})
+    assert [o["url"] for o in out] == ["https://b"]
