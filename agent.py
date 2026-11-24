@@ -731,7 +731,7 @@ def display_options(result: dict) -> list:
     out, seen = [], set()
     for o in sorted(options, key=_price_key):
         # نفس المنتج بنفس السعر في نفس المنصة (روابط مختلفة) = تكرار
-        key = (o.get("platform", ""), round(o["price_sar"]), re.sub(r"\W+", "", (o.get("name") or "").lower())[:20])
+        key = (o.get("platform", ""), round(o["price_sar"]))
         if key in seen or o.get("url") in {x.get("url") for x in out}:
             continue
         seen.add(key)

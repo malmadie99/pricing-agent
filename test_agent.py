@@ -581,6 +581,6 @@ def test_knockoff_and_duplicates():
     assert not agent.is_knockoff("Apple AirPods Pro 2", "سماعة ابل ايربودز برو 2")
     r = {"options": [
         {"name": "Apple AirPods Pro 2", "price_sar": 569, "platform": "أمازون", "url": "u1"},
-        {"name": "Apple AirPods Pro 2", "price_sar": 569, "platform": "أمازون", "url": "u2"},
+        {"name": "Apple AirPods Pro 2 Wireless Earbuds", "price_sar": 569, "platform": "أمازون", "url": "u2"},
         {"name": "Apple AirPods Pro 2", "price_sar": 799, "platform": "نون", "url": "u3"}]}
     assert [o["url"] for o in agent.display_options(r)] == ["u1", "u3"]
