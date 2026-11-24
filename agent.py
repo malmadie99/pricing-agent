@@ -625,11 +625,13 @@ def verify_options(request_text, options, page_text, llm=gemini, fetch=None) -> 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=8) as pool:
         structured = list(pool.map(lambda o: fetch(o["url"]) if o.get("url") else {}, options))
-    checked = []
+    checked, oos, unpriced = [], 0, 0
     for o, sd in zip(options, structured):
         if sd.get("available") is False:
+            oos += 1
             continue  # نافد حسب الصفحة
         if not sd.get("price") and not price_in_text(o.get("price_sar"), page_text.get(o.get("url"), "")):
+            unpriced += 1
             continue  # سعر ما نقدر نتحقق منه ولا هو مكتوب في الصفحة = ممكن يكون تقدير، نستبعده
         if sd.get("price"):
             cur = sd.get("currency") or "SAR"
@@ -659,7 +661,7 @@ def verify_options(request_text, options, page_text, llm=gemini, fetch=None) -> 
                            if verdict.get(i, {}).get("complete") and verdict.get(i, {}).get("matches")]
         except Exception as exc:  # لو فشلت المراجعة نكمل بالموجود
             print(f"verify failed: {type(exc).__name__}", file=sys.stderr)
-    print(f"candidates={len(options)} verified={len(checked)}")
+    print(f"candidates={len(options)} oos={oos} unpriced={unpriced} verified={len(checked)}")
     return checked
 
 
