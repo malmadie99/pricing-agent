@@ -1,9 +1,11 @@
 name: pricing-agent
 
-# يتشغّل كل 5 دقايق من cron-job.org (طلب POST على dispatches)، أو يدوياً من تبويب Actions.
-# جدولة GitHub الداخلية ما نعتمد عليها لأنها تتأخر أو ما تشتغل.
+# تشغيل دائم: كل تشغيلة تستقبل رسائل تيليجرام قرابة 5 ساعات ونص، وبعدها تشغّل اللي بعدها.
+# الجدولة كل ساعة احتياط، لو انقطعت السلسلة لأي سبب ترجع تشتغل.
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "23 * * * *"
 
 # تشغيلة وحدة بس في نفس الوقت، عشان ما ينعالج نفس الطلب مرتين
 concurrency:
@@ -12,11 +14,12 @@ concurrency:
 
 permissions:
   contents: write  # لحفظ الحالة المشفرة في state/state.enc
+  actions: write   # عشان التشغيلة تشغّل اللي بعدها
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
@@ -34,6 +37,7 @@ jobs:
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOOP_MINUTES: "330"
         run: python agent.py
 
       - name: Save state
@@ -49,3 +53,9 @@ jobs:
               sleep 5
             done
           fi
+
+      - name: Start next run
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pricing-agent.yml --ref main

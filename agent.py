@@ -1100,12 +1100,46 @@ def handle_stranger(tg, state, msg) -> None:
 
 # ---------------------------------------------------------------- التشغيل
 
+def run_watch_checks(tg, state, fetch=None):
+    for cid in list(state["users"]):
+        try:
+            check_watches(ChatTG(tg, state, cid, cid == tg.chat_id), user_state(state, cid), fetch)
+        except Exception as exc:
+            print(f"watch check failed: {type(exc).__name__}", file=sys.stderr)
+    save_state(state)
+
+
+def commit_state():
+    """يحفظ الحالة المشفرة في المستودع أثناء التشغيل الطويل (عشان ما تضيع لو انقطعت التشغيلة)."""
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+    import subprocess
+    cmds = [
+        ["git", "add", "-A", "state/"],
+        ["git", "-c", "user.name=pricing-agent", "-c", "user.email=pricing-agent@users.noreply.github.com",
+         "commit", "-q", "-m", "Update state [skip ci]"],
+        ["git", "pull", "--rebase", "-q"],
+        ["git", "push", "-q"],
+    ]
+    try:
+        if not subprocess.run(["git", "status", "--porcelain", "state/"], capture_output=True, text=True).stdout:
+            return
+        for c in cmds:
+            subprocess.run(c, check=True, capture_output=True, timeout=60)
+    except Exception as exc:
+        print(f"state commit failed: {type(exc).__name__}", file=sys.stderr)
+
+
 def run(tg: Telegram, research_fn=research, state=None, fetch=None, llm=gemini, clock=None) -> int:
     """يعالج الرسائل، ولو فيه محادثة شغالة يبقى يستقبل الردود فوراً لين 10 دقايق بدون رسائل."""
     clock = clock or _now
     state = normalize_state(state, tg.chat_id) if state is not None else load_state()
     start, last_activity, handled, first = clock(), None, 0, True
-    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch" and os.environ.get("KEEP_OPEN", "1") == "1":
+    # وضع التشغيل الدائم: يبقى يستقبل لين يخلص وقت التشغيلة، وبعدها الـ workflow يشغّل اللي بعدها
+    forever = timedelta(minutes=int(os.environ.get("LOOP_MINUTES", "0")))
+    last_watch_check = last_commit = start
+    if not forever and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch" \
+            and os.environ.get("KEEP_OPEN", "1") == "1":
         last_activity = start  # التشغيل اليدوي يفتح جلسة استماع حتى لو ما فيه رسائل
     while True:
         updates = tg.get_updates(wait=0 if first else 50)
@@ -1143,14 +1177,20 @@ def run(tg: Telegram, research_fn=research, state=None, fetch=None, llm=gemini, 
                 tg.ack(uid)  # نأكد الاستلام عشان ما تتكرر الرسالة
                 save_state(state)
         now = clock()
+        if forever:
+            if now - last_watch_check > timedelta(minutes=30):
+                last_watch_check = now
+                run_watch_checks(tg, state, fetch)
+            if now - last_commit > timedelta(minutes=20):
+                last_commit = now
+                commit_state()
+            if now - start > forever:
+                break
+            continue
         if last_activity is None or now - last_activity > SESSION_IDLE or now - start > SESSION_MAX:
             break
 
-    for cid, user in list(state["users"].items()):
-        try:
-            check_watches(ChatTG(tg, state, cid, cid == tg.chat_id), user_state(state, cid), fetch)
-        except Exception as exc:
-            print(f"watch check failed: {type(exc).__name__}", file=sys.stderr)
+    run_watch_checks(tg, state, fetch)
     save_state(state)
     print(f"handled={handled} users={len(state['users'])}")
     return handled

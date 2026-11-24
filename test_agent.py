@@ -458,3 +458,17 @@ def test_wrong_key_starts_fresh(monkeypatch):
     agent.save_state({"users": {"1": {}}, "pending": [], "usage": {}})
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "other")
     assert agent.load_state()["users"] == {}
+
+
+def test_forever_mode_keeps_listening_until_loop_ends(monkeypatch):
+    monkeypatch.setenv("LOOP_MINUTES", "60")
+    batches = [[], [upd(1, "111", "6")], [], [upd(2, "111", "طلب")], [], []]
+    minutes = iter([0, 5, 10, 20, 31, 40, 50, 61, 62, 63, 64, 65])
+    class TG(FakeTG):
+        def get_updates(self, offset=None, wait=0):
+            return batches.pop(0) if batches else []
+    tg = TG([])
+    base = agent._now()
+    n = agent.run(tg, research_fn=lambda t, **k: SAMPLE, state={"users": {}, "pending": [], "usage": {}},
+                  fetch=lambda u: {}, clock=lambda: base + timedelta(minutes=next(minutes)))
+    assert n == 1 and tg.acked == [1, 2]  # ما وقف عند أول دفعة فاضية
