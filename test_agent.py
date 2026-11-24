@@ -538,3 +538,16 @@ def test_direct_structured_candidates_skip_gemini_extraction():
     r = agent.research("x", llm=llm, search=hits, extract=lambda u: {},
                        fetch=lambda u: {"price": 50.0, "currency": "SAR", "available": True, "name": "منتج"})
     assert len(r["options"]) >= 7 and not any(calls)  # ما احتجنا طلب Gemini الكبير
+
+
+def test_partial_results_when_gemini_busy():
+    def llm(prompt, system=""):
+        if system:
+            raise agent.requests.HTTPError("503")
+        return json.dumps({"ar": "x", "en": "x"}) if "عبارتي" in prompt else '{"checks": []}'
+    hits = lambda q, d=None: [{"title": "p", "url": "https://one.sa/p", "content": ""},
+                              {"title": "q", "url": "https://two.com/q", "content": ""}]
+    r = agent.research("x", llm=llm, search=hits, extract=lambda u: {},
+                       fetch=lambda u: {"price": 50.0, "currency": "SAR"} if "one" in u else {})
+    assert [o["url"] for o in r["options"]] == ["https://one.sa/p"] and "مزدحمة" in r["note"]
+    assert "مزدحمة" in agent.format_report("x", r)

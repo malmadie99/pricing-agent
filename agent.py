@@ -21,7 +21,8 @@ GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-f
                  "gemini-3-flash", "gemini-2.5-flash"]
 MAX_OPTIONS = int(os.environ.get("MAX_OPTIONS", "7"))
 CHUNK = int(os.environ.get("CHUNK", "8"))  # عدد النتائج في كل طلب لـ Gemini
-DIRECT_PAGES = int(os.environ.get("DIRECT_PAGES", "30"))  # صفحات نقرأ سعرها مباشرة
+DIRECT_PAGES = int(os.environ.get("DIRECT_PAGES", "30"))
+TIME_BUDGET = int(os.environ.get("TIME_BUDGET", "150"))  # ثواني قبل ما نوقف البحث الإضافي  # صفحات نقرأ سعرها مباشرة
 SAUDI_SOURCES = {"أمازون", "نون", "سلة", "زد", "متاجر سعودية", "حراج"}
 TG_LIMIT = 3900  # حد تيليجرام 4096 حرف، نخلي هامش
 KSA = timezone(timedelta(hours=3))
@@ -250,8 +251,10 @@ def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) ->
         body["generationConfig"]["responseMimeType"] = "application/json"
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
 
-    last = None
+    last, busy_streak = None, 0
     for model in gemini_models():
+        if busy_streak >= 4:
+            break  # Google مزدحم على كل النماذج، ما نضيع وقت أكثر
         url = GEMINI_URL.format(model=model)
         payload = body
         if model.startswith("gemma"):  # Gemma ما يدعم تعليمات النظام ولا وضع JSON
@@ -276,7 +279,9 @@ def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) ->
             continue
         if r.status_code in (500, 502, 503, 504):
             _BUSY[model] = time.time()
+            busy_streak += 1
             continue  # مشغول، نجرب النموذج اللي بعده
+        busy_streak = 0
         r.raise_for_status()
         parts = r.json()["candidates"][0]["content"]["parts"]
         return "".join(p.get("text", "") for p in parts if not p.get("thought"))
@@ -373,6 +378,7 @@ def plan_queries(request_text: str, llm=gemini, enabled=None) -> list:
 
 def research(request_text: str, sources=None, llm=gemini, search=tavily, extract=tavily_extract,
              fetch=None) -> dict:
+    t0 = time.time()
     today = datetime.now(KSA).strftime("%Y-%m-%d")
     plan = plan_queries(request_text, llm, sources)
     print(f"queries={len(plan)}")
@@ -462,7 +468,7 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
     # نقسم النتائج دفعات صغيرة: الطلبات الكبيرة تطلع "النموذج مشغول" (503) كثير في الطبقة المجانية،
     # والصغيرة تمشي. ونوقف أول ما نكمل 7 خيارات متحقق منها.
     # 2) إذا ما كفّت، نخلي Gemini يستخرج من النتائج دفعات صغيرة
-    seen_urls, failures = {o["url"] for o in direct}, 0
+    seen_urls, note = {o["url"] for o in direct}, ""
     for k in range(0, len(results), CHUNK):
         if len(verified) >= MAX_OPTIONS:
             break
@@ -472,14 +478,17 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
             "نتائج البحث (استخدم هذه فقط، ولا تذكر رابط غير موجود فيها):\n"
             + json.dumps(chunk, ensure_ascii=False, indent=0)
         )
+        if time.time() - t0 > TIME_BUDGET and verified:
+            note = "⏱ وقفت البحث الإضافي عشان ما أطوّل عليك."
+            break
         try:
             raw = llm(prompt, system)
         except requests.RequestException as exc:
-            failures += 1
             print(f"chunk {k // CHUNK} failed: {error_detail(exc)[:120]}", file=sys.stderr, flush=True)
-            if failures >= 2 and not verified:
-                raise  # الخدمة واقفة فعلاً، نخلي إعادة المحاولة العامة تتصرف
-            continue
+            if not verified:
+                raise  # ما عندنا شي نعرضه، نخلي إعادة المحاولة العامة تتصرف
+            note = "⚠️ خدمة الذكاء الاصطناعي مزدحمة الحين، فالنتائج أقل من العادة. جرّب \"2 أعد البحث\" بعد شوي."
+            break
         result = parse_result("<json>" + raw + "</json>")
         options = result.get("options") if isinstance(result.get("options"), list) else []
         options = [o for o in options if isinstance(o, dict) and o.get("url") and o["url"] not in seen_urls]
@@ -490,7 +499,7 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
         if len(verified) >= MAX_OPTIONS:
             break
 
-    result = {"options": verified}
+    result = {"options": verified, "note": note}
     return result
 
 
@@ -719,6 +728,8 @@ def format_report(request_text: str, result: dict) -> str:
 
     if len(options) < MAX_OPTIONS:
         lines.append(f"لقيت {len(options)} خيارات بس تنطبق عليها الشروط.")
+    if result.get("note"):
+        lines.append(result["note"])
     return "\n".join(lines).strip()
 
 
