@@ -21,7 +21,7 @@ GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-f
                  "gemini-3-flash", "gemini-2.5-flash"]
 MAX_OPTIONS = int(os.environ.get("MAX_OPTIONS", "7"))
 CHUNK = int(os.environ.get("CHUNK", "8"))  # عدد النتائج في كل طلب لـ Gemini
-DIRECT_PAGES = int(os.environ.get("DIRECT_PAGES", "30"))
+DIRECT_PAGES = int(os.environ.get("DIRECT_PAGES", "50"))
 TIME_BUDGET = int(os.environ.get("TIME_BUDGET", "150"))  # ثواني قبل ما نوقف البحث الإضافي  # صفحات نقرأ سعرها مباشرة
 SAUDI_SOURCES = {"أمازون", "نون", "سلة", "زد", "متاجر سعودية", "حراج"}
 TG_LIMIT = 3900  # حد تيليجرام 4096 حرف، نخلي هامش
@@ -311,7 +311,7 @@ def tavily(query: str, domains=None) -> list:
         "api_key": os.environ["TAVILY_API_KEY"],
         "query": query,
         "search_depth": "basic",
-        "max_results": 5,
+        "max_results": 10,
     }
     if domains:
         body["include_domains"] = domains
