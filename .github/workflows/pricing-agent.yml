@@ -1,0 +1,51 @@
+name: pricing-agent
+
+# يتشغّل كل 5 دقايق من cron-job.org (طلب POST على dispatches)، أو يدوياً من تبويب Actions.
+# جدولة GitHub الداخلية ما نعتمد عليها لأنها تتأخر أو ما تشتغل.
+on:
+  workflow_dispatch:
+
+# تشغيلة وحدة بس في نفس الوقت، عشان ما ينعالج نفس الطلب مرتين
+concurrency:
+  group: pricing-agent
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # لحفظ الحالة المشفرة في state/state.enc
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pricing agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python agent.py
+
+      - name: Save state
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state/)" ]; then
+            git config user.name "pricing-agent"
+            git config user.email "pricing-agent@users.noreply.github.com"
+            git add -A state/
+            git commit -m "Update state [skip ci]"
+            for i in 1 2 3; do
+              git pull --rebase -q && git push -q && break
+              sleep 5
+            done
+          fi
