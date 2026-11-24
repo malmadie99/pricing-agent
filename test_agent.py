@@ -487,3 +487,11 @@ def test_search_retries_once_on_network_error():
     st["mode"] = "new"
     assert agent.handle_message(tg, st, {"text": "فلتر"}, flaky)
     assert n["i"] == 2 and any("أعيد المحاولة" in m for m in tg.sent)
+
+
+def test_model_rank_prefers_new_lite_then_flash():
+    names = ["gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite-preview",
+             "gemini-2.5-flash-lite", "gemini-3.8-flash", "gemini-3.1-flash-lite"]
+    assert sorted(names, key=agent._model_rank) == [
+        "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
+        "gemini-3.1-flash-lite-preview", "gemini-3.8-flash", "gemini-2.5-flash"]

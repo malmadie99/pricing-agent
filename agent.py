@@ -16,9 +16,9 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 # Flash-Lite حده المجاني 500 طلب باليوم، بينما Flash العادي 20 طلب بس
-GEMINI_MODELS = [m for m in os.environ.get(
-    "GEMINI_MODEL", "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.1-flash-lite-preview"
-).split(",") if m.strip()]
+# احتياط لو ما قدرنا نجيب قائمة النماذج من Google
+GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
+                 "gemini-3-flash", "gemini-2.5-flash"]
 MAX_OPTIONS = int(os.environ.get("MAX_OPTIONS", "7"))
 TG_LIMIT = 3900  # حد تيليجرام 4096 حرف، نخلي هامش
 KSA = timezone(timedelta(hours=3))
@@ -178,6 +178,47 @@ QUERY_PROMPT = """حوّل طلب الشراء التالي لعبارتي بح�
 """
 
 
+_MODELS_CACHE = None
+_DEAD_MODELS = set()  # نماذج رجعت 404 أو خلص حدها اليومي في هالتشغيلة
+
+
+def _model_rank(name: str):
+    """الأولوية: Flash-Lite الجديد (حده المجاني أعلى) ثم Flash، والمعاينات بعدها."""
+    m = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+    version = float(m.group(1)) if m else 0.0
+    lite = "lite" in name
+    preview = "preview" in name or "exp" in name
+    return (0 if lite else 1, 1 if preview else 0, -version, name)
+
+
+def gemini_models() -> list:
+    """النماذج المتاحة فعلاً على المفتاح، مرتبة. نسألها من Google بدل ما نخمن الأسماء."""
+    global _MODELS_CACHE
+    if os.environ.get("GEMINI_MODEL"):
+        return [m.strip() for m in os.environ["GEMINI_MODEL"].split(",") if m.strip()]
+    if _MODELS_CACHE is None:
+        found = []
+        try:
+            r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                             headers={"x-goog-api-key": os.environ.get("GEMINI_API_KEY", "")},
+                             params={"pageSize": 200}, timeout=30)
+            r.raise_for_status()
+            for m in r.json().get("models", []):
+                name = m.get("name", "").replace("models/", "")
+                if "generateContent" not in m.get("supportedGenerationMethods", []):
+                    continue
+                if not name.startswith("gemini-") or "flash" not in name:
+                    continue
+                if re.search(r"image|tts|audio|live|embed|thinking|robotics|computer", name):
+                    continue
+                found.append(name)
+        except Exception as exc:
+            print(f"model list failed: {type(exc).__name__}", file=sys.stderr)
+        _MODELS_CACHE = sorted(set(found), key=_model_rank)[:8] or list(GEMINI_MODELS)
+        print(f"gemini models: {_MODELS_CACHE}")
+    return [m for m in _MODELS_CACHE if m not in _DEAD_MODELS] or _MODELS_CACHE
+
+
 def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) -> str:
     parts = [{"text": prompt}]
     if image:  # (bytes, mime)
@@ -194,19 +235,25 @@ def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) ->
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
 
     last = None
-    for model in GEMINI_MODELS:
-        url = GEMINI_URL.format(model=model.strip())
+    for model in gemini_models():
+        url = GEMINI_URL.format(model=model)
         started = time.time()
         for attempt in range(3):
             r = requests.post(url, headers=headers, json=body, timeout=120)
-            if r.status_code in (429, 500, 503) and attempt < 2:
-                time.sleep(15 * (attempt + 1))  # حد الطلبات بالدقيقة، ننتظر ونعيد
+            if r.status_code in (500, 502, 503, 504) and attempt < 2:
+                time.sleep(10 * (attempt + 1))  # ضغط مؤقت على النموذج، ننتظر ونعيد
+                continue
+            if r.status_code == 429 and "PerDay" not in r.text and attempt < 2:
+                time.sleep(20)  # حد الدقيقة، مو حد اليوم
                 continue
             break
-        print(f"gemini {model} {r.status_code} {time.time() - started:.0f}s")
+        print(f"gemini {model} {r.status_code} {time.time() - started:.0f}s", flush=True)
         last = r
-        if r.status_code in (404, 429, 500, 502, 503, 504):
-            continue  # النموذج غير موجود أو خلص حده أو مشغول، نجرب اللي بعده
+        if r.status_code in (404, 429):
+            _DEAD_MODELS.add(model)  # ما نضيع وقت عليه مرة ثانية في هالتشغيلة
+            continue
+        if r.status_code in (500, 502, 503, 504):
+            continue  # مشغول، نجرب النموذج اللي بعده
         r.raise_for_status()
         parts = r.json()["candidates"][0]["content"]["parts"]
         return "".join(p.get("text", "") for p in parts if not p.get("thought"))
