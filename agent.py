@@ -20,7 +20,9 @@ import requests
 GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
                  "gemini-3-flash", "gemini-2.5-flash"]
 MAX_OPTIONS = int(os.environ.get("MAX_OPTIONS", "7"))
-CHUNK = int(os.environ.get("CHUNK", "14"))  # عدد النتائج في كل طلب لـ Gemini
+CHUNK = int(os.environ.get("CHUNK", "8"))  # عدد النتائج في كل طلب لـ Gemini
+DIRECT_PAGES = int(os.environ.get("DIRECT_PAGES", "30"))  # صفحات نقرأ سعرها مباشرة
+SAUDI_SOURCES = {"أمازون", "نون", "سلة", "زد", "متاجر سعودية", "حراج"}
 TG_LIMIT = 3900  # حد تيليجرام 4096 حرف، نخلي هامش
 KSA = timezone(timedelta(hours=3))
 
@@ -427,10 +429,43 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
     system = SYSTEM_PROMPT.replace("MAX_OPTIONS", "8")
     page_text = {r["url"]: r.get("page") or r.get("content", "") for r in results}
 
+    # 1) مرشحين مباشرين من البيانات المنظمة في صفحات المنتجات: سعر رسمي ومتوفر، بدون ما نحتاج Gemini.
+    cache = {}
+    base_fetch = fetch or fetch_structured
+
+    def cfetch(u):
+        if u not in cache:
+            cache[u] = base_fetch(u)
+        return cache[u]
+
+    from concurrent.futures import ThreadPoolExecutor
+    pool_items = results[:DIRECT_PAGES]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        sds = list(pool.map(lambda r: cfetch(r["url"]), pool_items))
+    direct = []
+    for r, sd in zip(pool_items, sds):
+        price = _sar(sd) if sd.get("price") else None
+        if price is None or sd.get("available") is False:
+            continue
+        saudi = r.get("source") in SAUDI_SOURCES or ".sa/" in r["url"] or r["url"].rstrip("/").endswith(".sa")
+        direct.append({
+            "name": (sd.get("name") or r.get("title") or "")[:120],
+            "price_sar": price, "url": r["url"], "platform": r.get("source", ""),
+            "seller": re.sub(r"^https?://(www\.)?([^/]+).*$", r"\2", r["url"]),
+            "location": "السعودية" if saudi else "خارج السعودية", "condition": "جديد",
+            "vat": "غير مذكور", "shipping": "غير مذكور", "import_fees": "لا يوجد" if saudi else "محتمل",
+        })
+    print(f"direct={len(direct)}", flush=True)
+    verified = verify_options(request_text, direct, page_text, llm, cfetch) if direct else []
+    fetch = cfetch
+
     # نقسم النتائج دفعات صغيرة: الطلبات الكبيرة تطلع "النموذج مشغول" (503) كثير في الطبقة المجانية،
     # والصغيرة تمشي. ونوقف أول ما نكمل 7 خيارات متحقق منها.
-    verified, seen_urls, failures = [], set(), 0
+    # 2) إذا ما كفّت، نخلي Gemini يستخرج من النتائج دفعات صغيرة
+    seen_urls, failures = {o["url"] for o in direct}, 0
     for k in range(0, len(results), CHUNK):
+        if len(verified) >= MAX_OPTIONS:
+            break
         chunk = results[k:k + CHUNK]
         prompt = (
             f"تاريخ اليوم: {today}\n\nطلب الشراء:\n{request_text}\n\n"
@@ -480,7 +515,8 @@ VERIFY_PROMPT = """طلب الشراء: {request}
 تحت قائمة منتجات مرشحة مع نص من صفحاتها. لكل منتج قرر بصرامة:
 - complete: هل هو الجهاز/المنتج الكامل نفسه المطلوب؟ (false إذا كان قطع غيار، شمعات، فلاتر بديلة، ملحقات، هيكل لحاله، أو طقم مستهلكات)
 - matches: false فقط إذا الاسم أو الصفحة تذكر رقم يخالف الطلب صراحة (مثلاً مرحلتين بدل 3، أو 10 انش بدل 20). إذا المواصفة غير مذكورة اعتبرها true.
-رجّع JSON فقط: {{"checks": [{{"i": 0, "complete": true, "matches": true}}]}}
+- opinion: سطر واحد قصير بالسعودي، رأي استشاري بحت عن ميزة المنتج أو سعره، بدون توصية.
+رجّع JSON فقط: {{"checks": [{{"i": 0, "complete": true, "matches": true, "opinion": "..."}}]}}
 
 المنتجات:
 {items}"""
@@ -607,6 +643,9 @@ def verify_options(request_text, options, page_text, llm=gemini, fetch=None) -> 
             data = json.loads(raw) if raw.strip().startswith("{") else parse_result("<json>" + raw + "</json>")
             verdict = {c.get("i"): c for c in data.get("checks", []) if isinstance(c, dict)}
             if verdict:
+                for i, o in enumerate(checked):
+                    if not o.get("opinion") and isinstance(verdict.get(i, {}).get("opinion"), str):
+                        o["opinion"] = verdict[i]["opinion"].strip()
                 checked = [o for i, o in enumerate(checked)
                            if verdict.get(i, {}).get("complete") and verdict.get(i, {}).get("matches")]
         except Exception as exc:  # لو فشلت المراجعة نكمل بالموجود

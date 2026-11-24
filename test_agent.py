@@ -122,8 +122,10 @@ def test_research_pipeline_dedup_and_prompt():
     result = agent.research("فلتر", llm=fake_llm, search=fake_search,
                             extract=lambda urls: {"https://noon.com": "فلتر جامبو كامل السعر 496 ر.س شامل الضريبة",
                                                   "https://ebay.com": "Jumbo filter Place bid now"},
-                            fetch=lambda u: {"price": 100.0, "currency": "SAR"})
-    assert len(result["options"]) == 2  # C بدون رابط ولا سعر = ينحذف
+                            fetch=lambda u: {"price": 100.0, "currency": "SAR"}
+                            if u in ("https://noon.com", "https://a", "https://b") else {})
+    # noon.com مباشرة من بيانات الصفحة، و A و B من Gemini، و C بدون رابط = ينحذف
+    assert sorted(o["url"] for o in result["options"]) == ["https://a", "https://b", "https://noon.com"]
     final_prompt = [p for p, s in calls if s][0]
     assert final_prompt.count("https://same") == 1 and "https://noon.com" in final_prompt
     assert "496 ر.س" in final_prompt
@@ -525,3 +527,14 @@ def test_gemma_ranked_after_gemini():
     names = ["gemma-4-31b-it", "gemini-3.5-flash-lite", "gemma-4-26b-it", "gemini-3.6-flash"]
     assert sorted(names, key=agent._model_rank) == ["gemini-3.5-flash-lite", "gemini-3.6-flash",
                                                     "gemma-4-31b-it", "gemma-4-26b-it"]
+
+
+def test_direct_structured_candidates_skip_gemini_extraction():
+    calls = []
+    def llm(prompt, system=""):
+        calls.append(system)
+        return json.dumps({"ar": "x", "en": "x"}) if "عبارتي" in prompt else '{"checks": []}'
+    hits = lambda q, d=None: [{"title": f"p{i}", "url": f"https://shop{i}.sa/p", "content": ""} for i in range(9)]
+    r = agent.research("x", llm=llm, search=hits, extract=lambda u: {},
+                       fetch=lambda u: {"price": 50.0, "currency": "SAR", "available": True, "name": "منتج"})
+    assert len(r["options"]) >= 7 and not any(calls)  # ما احتجنا طلب Gemini الكبير
