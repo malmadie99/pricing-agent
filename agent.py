@@ -543,7 +543,7 @@ VERIFY_PROMPT = """طلب الشراء: {request}
 
 تحت قائمة منتجات مرشحة مع نص من صفحاتها. لكل منتج قرر بصرامة:
 - complete: هل هو الجهاز/المنتج الكامل نفسه المطلوب؟ (false إذا كان قطع غيار، شمعات، فلاتر بديلة، ملحقات، هيكل لحاله، أو طقم مستهلكات)
-- matches: false فقط إذا الاسم أو الصفحة تذكر رقم يخالف الطلب صراحة (مثلاً مرحلتين بدل 3، أو 10 انش بدل 20). إذا المواصفة غير مذكورة اعتبرها true.
+- matches: false إذا الطلب يحدد ماركة أو موديل والمنتج ماركة ثانية أو بدون ماركة (OEM / ODM / generic / compatible). وكذلك false إذا الاسم أو الصفحة تذكر رقم يخالف الطلب صراحة (مثلاً مرحلتين بدل 3، أو 10 انش بدل 20). إذا المواصفة غير مذكورة اعتبرها true.
 - genuine: false إذا الصفحة تقول إنه تقليد أو "طبق الأصل" أو "هاي كوبي" أو "ماستر كوبي"، أو إذا السعر أقل بكثير من سعر السوق المعروف لماركة أصلية (مثلاً سماعة أبل أصلية بأقل من نص سعرها). غير كذا true.
 - opinion: سطر واحد قصير بالسعودي، رأي استشاري بحت عن ميزة المنتج أو سعره، بدون توصية.
 رجّع JSON فقط: {{"checks": [{{"i": 0, "complete": true, "matches": true, "genuine": true, "opinion": "..."}}]}}
@@ -630,6 +630,17 @@ def price_in_text(price, text: str) -> bool:
     return re.search(rf"(?<!\d){whole}(?:\.\d+)?(?!\d)", digits) is not None
 
 
+KNOCKOFF_RE = re.compile(
+    r"\b(oem|odm|generic|compatible|replica|copy|clone|for airpods|like airpods)\b|تقليد|كوبي|طبق الأصل|متوافق مع|شبيه",
+    re.I,
+)
+
+
+def is_knockoff(name: str, request_text: str) -> bool:
+    """منتج بدون ماركة أو تقليد، والمستخدم ما طلب كذا."""
+    return bool(KNOCKOFF_RE.search(name or "")) and not KNOCKOFF_RE.search(request_text or "")
+
+
 def is_part(name: str, request_text: str) -> bool:
     name, req = (name or "").lower(), request_text.lower()
     return any(w in name and w not in req for w in PART_WORDS)
@@ -640,7 +651,7 @@ def verify_options(request_text, options, page_text, llm=gemini, fetch=None) -> 
     # 1) استبعاد القطع والمستهلكات من الاسم
     before = len(options)
     options = [o for o in options if isinstance(o, dict) and not is_part(o.get("name", ""), request_text)
-               and is_product_url(o.get("url", ""))]
+               and not is_knockoff(o.get("name", ""), request_text) and is_product_url(o.get("url", ""))]
     print(f"llm_options={before} after_parts={len(options)}")
 
     # 2) السعر والتوفر من بيانات الصفحة الرسمية بدل تقدير النموذج
@@ -717,7 +728,15 @@ def display_options(result: dict) -> list:
     """الخيارات بنفس الترتيب والترقيم اللي يشوفه المستخدم."""
     # بدون سعر = مو قابل للشراء الفوري، نستبعده
     options = [o for o in result.get("options", []) if isinstance(o.get("price_sar"), (int, float))]
-    return sorted(options, key=_price_key)[:MAX_OPTIONS]
+    out, seen = [], set()
+    for o in sorted(options, key=_price_key):
+        # نفس المنتج بنفس السعر في نفس المنصة (روابط مختلفة) = تكرار
+        key = (o.get("platform", ""), round(o["price_sar"]), re.sub(r"\W+", "", (o.get("name") or "").lower())[:20])
+        if key in seen or o.get("url") in {x.get("url") for x in out}:
+            continue
+        seen.add(key)
+        out.append(o)
+    return out[:MAX_OPTIONS]
 
 
 def format_report(request_text: str, result: dict) -> str:

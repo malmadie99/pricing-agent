@@ -574,3 +574,13 @@ def test_verify_rejects_fakes_and_clears_llm_price_note():
                                fetch=lambda u: {"price": 269.0 if "x" in u else 899.0, "currency": "SAR"})
     assert [o["url"] for o in out] == ["https://y.sa/p2"]
     assert out[0]["price_note"] == "" and out[0]["opinion"] == "سعر مناسب"
+
+
+def test_knockoff_and_duplicates():
+    assert agent.is_knockoff("ANC OEM ODM Earphone TWS", "سماعة ابل ايربودز برو 2")
+    assert not agent.is_knockoff("Apple AirPods Pro 2", "سماعة ابل ايربودز برو 2")
+    r = {"options": [
+        {"name": "Apple AirPods Pro 2", "price_sar": 569, "platform": "أمازون", "url": "u1"},
+        {"name": "Apple AirPods Pro 2", "price_sar": 569, "platform": "أمازون", "url": "u2"},
+        {"name": "Apple AirPods Pro 2", "price_sar": 799, "platform": "نون", "url": "u3"}]}
+    assert [o["url"] for o in agent.display_options(r)] == ["u1", "u3"]
