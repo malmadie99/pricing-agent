@@ -181,10 +181,14 @@ QUERY_PROMPT = """حوّل طلب الشراء التالي لعبارتي بح�
 
 _MODELS_CACHE = None
 _DEAD_MODELS = set()  # نماذج رجعت 404 أو خلص حدها اليومي في هالتشغيلة
+_BUSY = {}            # آخر وقت رجع فيه النموذج 503
 
 
 def _model_rank(name: str):
-    """الأولوية: Flash-Lite الجديد (حده المجاني أعلى) ثم Flash، والمعاينات بعدها."""
+    """الأولوية: Flash-Lite الجديد (حده المجاني أعلى) ثم Flash، وبعدها Gemma (سعة منفصلة)."""
+    if name.startswith("gemma"):
+        size = re.search(r"(\d+)b", name)
+        return (2, 0, -(int(size.group(1)) if size else 0), name)
     m = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
     version = float(m.group(1)) if m else 0.0
     lite = "lite" in name
@@ -208,16 +212,25 @@ def gemini_models() -> list:
                 name = m.get("name", "").replace("models/", "")
                 if "generateContent" not in m.get("supportedGenerationMethods", []):
                     continue
-                if not name.startswith("gemini-") or "flash" not in name:
+                is_gemma = name.startswith("gemma-") and "it" in name and not re.search(r"\b(1b|2b|4b|e2b|e4b)\b|-(1b|2b|4b|e2b|e4b)", name)
+                if not (name.startswith("gemini-") and "flash" in name) and not is_gemma:
                     continue
                 if re.search(r"image|tts|audio|live|embed|thinking|robotics|computer", name):
                     continue
                 found.append(name)
         except Exception as exc:
             print(f"model list failed: {type(exc).__name__}", file=sys.stderr)
-        _MODELS_CACHE = sorted(set(found), key=_model_rank)[:8] or list(GEMINI_MODELS)
+        ranked = sorted(set(found), key=_model_rank)
+        gemini_ = [m for m in ranked if m.startswith("gemini")][:7]
+        gemma_ = [m for m in ranked if m.startswith("gemma")][:2]
+        _MODELS_CACHE = (gemini_ + gemma_) or list(GEMINI_MODELS)
         print(f"gemini models: {_MODELS_CACHE}")
-    return [m for m in _MODELS_CACHE if m not in _DEAD_MODELS] or _MODELS_CACHE
+    alive = [m for m in _MODELS_CACHE if m not in _DEAD_MODELS] or _MODELS_CACHE
+    # النماذج اللي ردت "مشغول" قبل أقل من 3 دقايق نأخرها لآخر القائمة
+    now = time.time()
+    free = [m for m in alive if now - _BUSY.get(m, 0) > 180]
+    busy = [m for m in alive if m not in free]
+    return free + busy
 
 
 def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) -> str:
@@ -238,9 +251,15 @@ def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) ->
     last = None
     for model in gemini_models():
         url = GEMINI_URL.format(model=model)
+        payload = body
+        if model.startswith("gemma"):  # Gemma ما يدعم تعليمات النظام ولا وضع JSON
+            payload = {"contents": [{"role": "user", "parts": (
+                [p for p in parts if "inline_data" in p]
+                + [{"text": (system + "\n\n" if system else "") + prompt + "\n\nرجّع JSON فقط."}])}],
+                "generationConfig": {"temperature": 0.2}}
         started = time.time()
         for attempt in range(3):
-            r = requests.post(url, headers=headers, json=body, timeout=90)
+            r = requests.post(url, headers=headers, json=payload, timeout=90)
             if r.status_code in (500, 502, 503, 504) and attempt < 1:
                 time.sleep(5)  # ضغط مؤقت: محاولة وحدة سريعة وبعدها ننتقل للنموذج اللي بعده
                 continue
@@ -254,6 +273,7 @@ def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) ->
             _DEAD_MODELS.add(model)  # ما نضيع وقت عليه مرة ثانية في هالتشغيلة
             continue
         if r.status_code in (500, 502, 503, 504):
+            _BUSY[model] = time.time()
             continue  # مشغول، نجرب النموذج اللي بعده
         r.raise_for_status()
         parts = r.json()["candidates"][0]["content"]["parts"]
@@ -596,17 +616,20 @@ def verify_options(request_text, options, page_text, llm=gemini, fetch=None) -> 
 
 
 def parse_result(text: str) -> dict:
-    match = re.search(r"<json>\s*(.*?)\s*</json>", text, re.S)
-    if not match:
-        match = re.search(r"```json\s*(.*?)\s*```", text, re.S)
-    if match:
+    candidates = []
+    for pat in (r"<json>\s*(.*?)\s*</json>", r"```(?:json)?\s*(.*?)\s*```"):
+        candidates += re.findall(pat, text, re.S)
+    if "{" in text:
+        candidates.append(text[text.index("{"):text.rindex("}") + 1])
+    for c in candidates:
+        c = re.sub(r"^```(?:json)?|```$", "", c.strip()).strip()
         try:
-            data = json.loads(match.group(1))
-            if isinstance(data, dict):
-                data.setdefault("options", [])
-                return data
+            data = json.loads(c)
         except json.JSONDecodeError:
-            pass
+            continue
+        if isinstance(data, dict):
+            data.setdefault("options", [])
+            return data
     return {"options": [], "raw": text.strip()}
 
 

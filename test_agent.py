@@ -512,3 +512,16 @@ def test_verify_drops_unverifiable_estimated_price():
                                llm=lambda p, s="": '{"checks":[{"i":0,"complete":true,"matches":true}]}',
                                fetch=lambda u: {})
     assert [o["url"] for o in out] == ["https://b"]
+
+
+def test_parse_result_handles_fenced_json_inside_tags():
+    r = agent.parse_result('<json>```json\n{"options":[{"name":"x"}]}\n```</json>')
+    assert r["options"][0]["name"] == "x"
+    r = agent.parse_result('Here you go: {"checks":[{"i":0}]} thanks')
+    assert r["checks"][0]["i"] == 0
+
+
+def test_gemma_ranked_after_gemini():
+    names = ["gemma-4-31b-it", "gemini-3.5-flash-lite", "gemma-4-26b-it", "gemini-3.6-flash"]
+    assert sorted(names, key=agent._model_rank) == ["gemini-3.5-flash-lite", "gemini-3.6-flash",
+                                                    "gemma-4-31b-it", "gemma-4-26b-it"]
