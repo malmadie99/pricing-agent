@@ -551,3 +551,26 @@ def test_partial_results_when_gemini_busy():
                        fetch=lambda u: {"price": 50.0, "currency": "SAR"} if "one" in u else {})
     assert [o["url"] for o in r["options"]] == ["https://one.sa/p"] and "مزدحمة" in r["note"]
     assert "مزدحمة" in agent.format_report("x", r)
+
+
+def test_non_product_urls_filtered():
+    f = agent.is_product_url
+    assert not f("https://haraj.com.sa/search/%D8%B3%D9%85")
+    assert f("https://haraj.com.sa/11128963338/jumbo")
+    assert not f("https://sa.pricena.com/ar/airpods-pro-2")
+    assert not f("https://www.alibaba.com/showroom/stainless-steel-u-channel.html")
+    assert not f("https://www.amazon.sa/s?k=airpods")
+    assert f("https://www.amazon.sa/dp/B0CHWRXH8B")
+    assert f("https://salla.sa/fas.sa/airpods-pro-2/p12345")
+
+
+def test_verify_rejects_fakes_and_clears_llm_price_note():
+    opts = [{"name": "AirPods Pro 2", "price_sar": 269, "url": "https://x.sa/p1", "price_note": "السعر غير مذكور"},
+            {"name": "AirPods Pro 2 اصلية", "price_sar": 899, "url": "https://y.sa/p2", "price_note": "غير مذكور"}]
+    llm = lambda p, s="": json.dumps({"checks": [
+        {"i": 0, "complete": True, "matches": True, "genuine": False},
+        {"i": 1, "complete": True, "matches": True, "genuine": True, "opinion": "سعر مناسب"}]})
+    out = agent.verify_options("ايربودز برو 2", opts, {}, llm=llm,
+                               fetch=lambda u: {"price": 269.0 if "x" in u else 899.0, "currency": "SAR"})
+    assert [o["url"] for o in out] == ["https://y.sa/p2"]
+    assert out[0]["price_note"] == "" and out[0]["opinion"] == "سعر مناسب"

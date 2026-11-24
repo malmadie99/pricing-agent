@@ -166,6 +166,24 @@ TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
 FOREIGN_STOREFRONT_RE = re.compile(
     r"noon\.com/(?!saudi)[a-z]+-(?:ar|en)/|amazon\.(?!sa\b)[a-z.]+/|trendyol\.com/(?!ar/|en/)", re.I
 )
+# صفحات بحث أو أقسام أو مقارنة أسعار: مو صفحة منتج تقدر تشتري منها مباشرة
+NON_PRODUCT_URL_RE = re.compile(
+    r"/search|[?&](q|k|query|keyword|s)=|/s\?|/category|/categories|/collections?/?(\?|$)|/showroom/|/tag/|/tags/"
+    r"|/wholesale/|/popular/|/w/|/shop/?$|/brands?/|/compare"
+    r"|pricena\.|priceena|pricespy|pricerunner|idealo\.|google\.[a-z.]+/shopping|yaoota|ubuy\.|desertcart\.|/blog/",
+    re.I,
+)
+HARAJ_AD_RE = re.compile(r"haraj\.com\.sa/(?:en/)?\d{5,}", re.I)
+
+
+def is_product_url(url: str) -> bool:
+    if NON_PRODUCT_URL_RE.search(url):
+        return False
+    if "haraj.com.sa" in url and not HARAJ_AD_RE.search(url):
+        return False  # في حراج نقبل صفحات الإعلانات بس
+    return True
+
+
 UNAVAILABLE_RE = re.compile(
     r"place bid|bid now|auction ends|out of stock|sold out|currently unavailable|"
     r"نفدت الكمية|نفذت الكمية|غير متوفر حالي|المنتج غير متوفر|مزايدة|مزاد|محذوف أو قديم|الإعلان محذوف",
@@ -395,6 +413,8 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
             url = h.get("url")
             if url and FOREIGN_STOREFRONT_RE.search(url):
                 continue  # نسخة دولة ثانية
+            if url and not is_product_url(url):
+                continue  # صفحة بحث أو قسم أو موقع مقارنة
             if url and url not in seen:
                 seen.add(url)
                 per_source.setdefault(name, []).append({
@@ -524,8 +544,9 @@ VERIFY_PROMPT = """طلب الشراء: {request}
 تحت قائمة منتجات مرشحة مع نص من صفحاتها. لكل منتج قرر بصرامة:
 - complete: هل هو الجهاز/المنتج الكامل نفسه المطلوب؟ (false إذا كان قطع غيار، شمعات، فلاتر بديلة، ملحقات، هيكل لحاله، أو طقم مستهلكات)
 - matches: false فقط إذا الاسم أو الصفحة تذكر رقم يخالف الطلب صراحة (مثلاً مرحلتين بدل 3، أو 10 انش بدل 20). إذا المواصفة غير مذكورة اعتبرها true.
+- genuine: false إذا الصفحة تقول إنه تقليد أو "طبق الأصل" أو "هاي كوبي" أو "ماستر كوبي"، أو إذا السعر أقل بكثير من سعر السوق المعروف لماركة أصلية (مثلاً سماعة أبل أصلية بأقل من نص سعرها). غير كذا true.
 - opinion: سطر واحد قصير بالسعودي، رأي استشاري بحت عن ميزة المنتج أو سعره، بدون توصية.
-رجّع JSON فقط: {{"checks": [{{"i": 0, "complete": true, "matches": true, "opinion": "..."}}]}}
+رجّع JSON فقط: {{"checks": [{{"i": 0, "complete": true, "matches": true, "genuine": true, "opinion": "..."}}]}}
 
 المنتجات:
 {items}"""
@@ -618,7 +639,8 @@ def verify_options(request_text, options, page_text, llm=gemini, fetch=None) -> 
     fetch = fetch or fetch_structured
     # 1) استبعاد القطع والمستهلكات من الاسم
     before = len(options)
-    options = [o for o in options if isinstance(o, dict) and not is_part(o.get("name", ""), request_text)]
+    options = [o for o in options if isinstance(o, dict) and not is_part(o.get("name", ""), request_text)
+               and is_product_url(o.get("url", ""))]
     print(f"llm_options={before} after_parts={len(options)}")
 
     # 2) السعر والتوفر من بيانات الصفحة الرسمية بدل تقدير النموذج
@@ -639,14 +661,14 @@ def verify_options(request_text, options, page_text, llm=gemini, fetch=None) -> 
             if rate:
                 o["price_sar"] = round(sd["price"] * rate, 2)
                 o["price_verified"] = True
-                if cur != "SAR":
-                    o["price_note"] = f"تقريبي من {sd['price']:g} {cur}"
+                # ملاحظة النموذج عن السعر ما تعود صحيحة بعد ما أخذنا السعر الرسمي من الصفحة
+                o["price_note"] = f"تقريبي من {sd['price']:g} {cur}" if cur != "SAR" else ""
         checked.append(o)
 
     # 3) مراجعة ثانية: الجهاز كامل ويطابق المواصفات؟
     if checked:
         items = "\n".join(
-            f"[{i}] {o.get('name', '')} | {o.get('specs', '')} | {page_text.get(o.get('url'), '')[:800]}"
+            f"[{i}] {o.get('name', '')} | {o.get('specs', '')} | السعر {o.get('price_sar')} ريال | {page_text.get(o.get('url'), '')[:700]}"
             for i, o in enumerate(checked)
         )
         try:
@@ -658,7 +680,8 @@ def verify_options(request_text, options, page_text, llm=gemini, fetch=None) -> 
                     if not o.get("opinion") and isinstance(verdict.get(i, {}).get("opinion"), str):
                         o["opinion"] = verdict[i]["opinion"].strip()
                 checked = [o for i, o in enumerate(checked)
-                           if verdict.get(i, {}).get("complete") and verdict.get(i, {}).get("matches")]
+                           if verdict.get(i, {}).get("complete") and verdict.get(i, {}).get("matches")
+                           and verdict.get(i, {}).get("genuine", True) is not False]
         except Exception as exc:  # لو فشلت المراجعة نكمل بالموجود
             print(f"verify failed: {type(exc).__name__}", file=sys.stderr)
     print(f"candidates={len(options)} oos={oos} unpriced={unpriced} verified={len(checked)}")
