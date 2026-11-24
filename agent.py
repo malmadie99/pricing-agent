@@ -20,6 +20,7 @@ import requests
 GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
                  "gemini-3-flash", "gemini-2.5-flash"]
 MAX_OPTIONS = int(os.environ.get("MAX_OPTIONS", "7"))
+CHUNK = int(os.environ.get("CHUNK", "14"))  # عدد النتائج في كل طلب لـ Gemini
 TG_LIMIT = 3900  # حد تيليجرام 4096 حرف، نخلي هامش
 KSA = timezone(timedelta(hours=3))
 
@@ -403,33 +404,36 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
     print(f"pages={len(pages)} dropped={len(results) - len(kept)}")
     results = kept
 
-    system = SYSTEM_PROMPT.replace("MAX_OPTIONS", str(MAX_OPTIONS + 8))
+    system = SYSTEM_PROMPT.replace("MAX_OPTIONS", "8")
     page_text = {r["url"]: r.get("page") or r.get("content", "") for r in results}
 
-    # النموذج المجاني أحياناً يرجع خيارات قليلة، فنعيد على النتائج اللي ما استخدمها لين نكمل 7
-    verified, used = [], set()
-    for round_no in range(3):
-        remaining = [r for r in results if r["url"] not in used]
-        if not remaining:
-            break
-        sources = json.dumps(remaining[:50], ensure_ascii=False, indent=0)
+    # نقسم النتائج دفعات صغيرة: الطلبات الكبيرة تطلع "النموذج مشغول" (503) كثير في الطبقة المجانية،
+    # والصغيرة تمشي. ونوقف أول ما نكمل 7 خيارات متحقق منها.
+    verified, seen_urls, failures = [], set(), 0
+    for k in range(0, len(results), CHUNK):
+        chunk = results[k:k + CHUNK]
         prompt = (
             f"تاريخ اليوم: {today}\n\nطلب الشراء:\n{request_text}\n\n"
-            "نتائج البحث (استخدم هذه فقط، ولا تذكر رابط غير موجود فيها):\n" + sources
+            "نتائج البحث (استخدم هذه فقط، ولا تذكر رابط غير موجود فيها):\n"
+            + json.dumps(chunk, ensure_ascii=False, indent=0)
         )
-        raw = llm(prompt, system)
+        try:
+            raw = llm(prompt, system)
+        except requests.RequestException as exc:
+            failures += 1
+            print(f"chunk {k // CHUNK} failed: {error_detail(exc)[:120]}", file=sys.stderr, flush=True)
+            if failures >= 2 and not verified:
+                raise  # الخدمة واقفة فعلاً، نخلي إعادة المحاولة العامة تتصرف
+            continue
         result = parse_result("<json>" + raw + "</json>")
         options = result.get("options") if isinstance(result.get("options"), list) else []
-        options = [o for o in options if isinstance(o, dict) and o.get("url") not in used]
-        print(f"round={round_no} raw_len={len(raw)} options={len(options)}")
-        if not options:
-            break
-        used.update(o.get("url") for o in options)
-        verified += verify_options(request_text, options, page_text, llm, fetch)
+        options = [o for o in options if isinstance(o, dict) and o.get("url") and o["url"] not in seen_urls]
+        seen_urls.update(o["url"] for o in options)
+        print(f"chunk={k // CHUNK} options={len(options)}", flush=True)
+        if options:
+            verified += verify_options(request_text, options, page_text, llm, fetch)
         if len(verified) >= MAX_OPTIONS:
             break
-        # الجولة الجاية: نستبعد النتائج اللي عُرضت عليه أول مرة ونعطيه البقية
-        used.update(r["url"] for r in remaining[:25])
 
     result = {"options": verified}
     return result
