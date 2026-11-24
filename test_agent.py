@@ -12,6 +12,7 @@ def tmp_state(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "STATE_FILE", str(tmp_path / "state.enc"))
     monkeypatch.setattr(agent, "LEGACY_STATE_FILE", str(tmp_path / "state.json"))
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setattr(agent, "RETRY_WAIT", 0)
     monkeypatch.setattr(agent, "SESSION_IDLE", timedelta(0))  # الاختبارات ما تنتظر جلسة
 
 
@@ -101,6 +102,7 @@ def test_run_survives_research_error():
     agent.run(tg, research_fn=boom)
     assert tg.acked == [1, 5, 2, 6]
     assert sum("صار خطأ" in s for s in tg.sent) == 2
+    assert sum("خطأ تقني" in s for s in tg.sent) == 2
 
 
 def test_research_pipeline_dedup_and_prompt():
@@ -472,3 +474,16 @@ def test_forever_mode_keeps_listening_until_loop_ends(monkeypatch):
     n = agent.run(tg, research_fn=lambda t, **k: SAMPLE, state={"users": {}, "pending": [], "usage": {}},
                   fetch=lambda u: {}, clock=lambda: base + timedelta(minutes=next(minutes)))
     assert n == 1 and tg.acked == [1, 2]  # ما وقف عند أول دفعة فاضية
+
+
+def test_search_retries_once_on_network_error():
+    tg, st, calls, say = _chat()
+    n = {"i": 0}
+    def flaky(t, **k):
+        n["i"] += 1
+        if n["i"] == 1:
+            raise agent.requests.ConnectionError("busy")
+        return SAMPLE
+    st["mode"] = "new"
+    assert agent.handle_message(tg, st, {"text": "فلتر"}, flaky)
+    assert n["i"] == 2 and any("أعيد المحاولة" in m for m in tg.sent)

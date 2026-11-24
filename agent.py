@@ -205,8 +205,8 @@ def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) ->
             break
         print(f"gemini {model} {r.status_code} {time.time() - started:.0f}s")
         last = r
-        if r.status_code in (404, 429):
-            continue  # النموذج غير موجود أو خلص حده اليومي، نجرب اللي بعده
+        if r.status_code in (404, 429, 500, 502, 503, 504):
+            continue  # النموذج غير موجود أو خلص حده أو مشغول، نجرب اللي بعده
         r.raise_for_status()
         parts = r.json()["candidates"][0]["content"]["parts"]
         return "".join(p.get("text", "") for p in parts if not p.get("thought"))
@@ -836,9 +836,28 @@ def describe_link(url: str, fetch=None, extract=None, llm=gemini):
     return name.strip(), ref
 
 
+RETRY_WAIT = int(os.environ.get("RETRY_WAIT", "20"))
+
+
+def error_detail(exc) -> str:
+    """وصف الخطأ بدون أسرار: نوعه، والخدمة، ورمز الحالة."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return type(exc).__name__
+    host = re.sub(r"^https?://([^/]+).*$", r"\1", resp.url or "")
+    return f"{type(exc).__name__} {resp.status_code} {host} {resp.text[:200]}"
+
+
 def handle_request(tg: Telegram, text: str, research_fn=research, sources=None) -> list:
     tg.send(f"استلمت طلبك، جاري البحث في {len(sources or SOURCE_NAMES)} مواقع.")
-    result = research_fn(text, sources=sources)
+    try:
+        result = research_fn(text, sources=sources)
+    except requests.RequestException as exc:
+        # غالباً ضغط مؤقت على Gemini أو Tavily: نعيد مرة وحدة تلقائياً قبل ما نبلغ بالخطأ
+        print(f"research retry after {error_detail(exc)}", file=sys.stderr, flush=True)
+        tg.send("الخدمة مشغولة شوي، أعيد المحاولة تلقائياً...")
+        time.sleep(RETRY_WAIT)
+        result = research_fn(text, sources=sources)
     tg.send(format_report(text, result))
     return display_options(result)
 
@@ -1164,13 +1183,11 @@ def run(tg: Telegram, research_fn=research, state=None, fetch=None, llm=gemini, 
                 else:
                     handle_stranger(tg, state, msg)
             except Exception as exc:  # نكمل باقي الرسائل حتى لو وحدة فشلت
-                detail = ""
-                resp = getattr(exc, "response", None)
-                if resp is not None:  # رسالة الخطأ من الخدمة (ما فيها مفاتيح)
-                    detail = f" {resp.status_code} {resp.url.split('?')[0]} {resp.text[:300]}"
-                print(f"update {uid} failed: {type(exc).__name__}{detail}", file=sys.stderr)
+                detail = error_detail(exc)
+                print(f"update {uid} failed: {detail}", file=sys.stderr, flush=True)
                 try:
-                    ctg.send(f"صار خطأ ({type(exc).__name__}). أعد المحاولة بعد شوي، أو 0 للقائمة.")
+                    ctg.send("صار خطأ مؤقت في خدمة البحث. أعد المحاولة بعد شوي، أو 0 للقائمة.")
+                    tg.send(f"⚠️ خطأ تقني (للمدير): {detail[:300]}")  # عشان نعرف السبب ونصلّحه
                 except Exception:
                     pass
             finally:
