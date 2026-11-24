@@ -244,8 +244,8 @@ def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) ->
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"temperature": 0.2},
     }
-    if system:
-        body["systemInstruction"] = {"parts": [{"text": system}]}
+    if system:  # نحط التعليمات داخل الرسالة: طلبات systemInstruction الكبيرة ترجع 503 كثير في الطبقة المجانية
+        parts[-1] = {"text": system + "\n\n----\n\n" + prompt}
     if json_mode:
         body["generationConfig"]["responseMimeType"] = "application/json"
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
