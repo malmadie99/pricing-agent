@@ -13,6 +13,7 @@ def tmp_state(tmp_path, monkeypatch):
     monkeypatch.setattr(agent, "LEGACY_STATE_FILE", str(tmp_path / "state.json"))
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setattr(agent, "RETRY_WAIT", 0)
+    monkeypatch.setattr(agent, "CHANNELS", [])  # الاختبارات ما تتصل بتيليجرام
     monkeypatch.setattr(agent, "SESSION_IDLE", timedelta(0))  # الاختبارات ما تنتظر جلسة
 
 
@@ -323,7 +324,7 @@ def test_menu_sources_toggle_applies_to_search():
 def test_sources_cannot_disable_all():
     tg, st, calls, say = _chat()
     say("4")
-    say(" ".join(str(i) for i in range(1, 11)))
+    say(" ".join(str(i) for i in range(1, len(agent.SOURCE_NAMES) + 1)))
     assert "لازم يبقى" in tg.sent[-1]
 
 
@@ -617,3 +618,26 @@ def test_gemini_busy_switches_to_groq(monkeypatch):
     monkeypatch.setattr(agent.requests, "post", post)
     assert agent.gemini("hi") == '{"ok": 1}'
     assert any("groq" in p for p in posts) and sum("gemini-b" in p for p in posts) == 0
+
+
+CHANNEL_HTML = """<div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message" data-post="shopper_ar1/900">
+<div class="tgme_widget_message_text js-message_text" dir="auto">سماعة هواوي FreeBuds Pro 5 بالغاء ضوضاء<br/>استخدم لها كود MGDE115 وتصير ب 666 ريال وشحن من السعودية<br/><a href="https://www.aliexpress.com/item/1005011707420516.html">https://www.aliexpress.com/item/1005011707420516.html</a></div>
+<time datetime="DATE" class="time">22:10</time></div></div>
+<div class="tgme_widget_message_wrap js-widget_message_wrap"><div class="tgme_widget_message" data-post="shopper_ar1/100">
+<div class="tgme_widget_message_text js-message_text">عرض قديم كود ABCD1 وتصير ب 99 ريال <a href="https://x.com/a">x</a></div>
+<time datetime="2024-01-01T10:00:00+00:00"></time></div></div>"""
+
+
+def test_channel_candidates_parse_price_codes_and_skip_old():
+    recent = (agent._now() - timedelta(days=10)).isoformat()
+    page = CHANNEL_HTML.replace("DATE", recent)
+    get = lambda url: _Resp(200, text=page)
+    out = agent.channel_candidates("shopper_ar1", {"ar": "سماعة هواوي فري بودز", "en": "huawei freebuds pro"}, get=get)
+    assert len(out) == 1
+    o = out[0]
+    assert o["price_sar"] == 666 and o["coupon"] == "MGDE115" and o["post"] == "https://t.me/shopper_ar1/900"
+    assert o["url"].startswith("https://www.aliexpress.com/") and o["location"] == "شحن من السعودية"
+
+
+def test_channel_is_a_toggleable_source():
+    assert "قناة shopper_ar1" in agent.SOURCE_NAMES

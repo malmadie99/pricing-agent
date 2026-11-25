@@ -319,7 +319,10 @@ def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) ->
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
 
     last, busy_streak, tried_groq = None, 0, False
-    for model in gemini_models():
+    models = gemini_models()
+    if image:  # قراءة الصور: نماذج Flash الكاملة أدق من Lite
+        models = sorted(models, key=lambda m: (0 if "flash" in m and "lite" not in m else 1))
+    for model in models:
         if busy_streak >= 4:
             break  # Google مزدحم على كل النماذج، ما نضيع وقت أكثر
         if busy_streak >= 1 and not tried_groq and not image and os.environ.get("GROQ_API_KEY"):
@@ -435,9 +438,9 @@ def product_terms(request_text: str, llm=gemini) -> dict:
     return terms
 
 
-def plan_queries(request_text: str, llm=gemini, enabled=None) -> list:
+def plan_queries(request_text: str, llm=gemini, enabled=None, terms=None) -> list:
     """استعلام لكل مصدر مفعّل ولكل لغة: [(المصدر، الاستعلام، النطاقات)]"""
-    terms = product_terms(request_text, llm)
+    terms = terms or product_terms(request_text, llm)
     plan = []
     for name, domains, langs in SOURCES:
         if enabled is not None and name not in enabled:
@@ -452,11 +455,100 @@ def plan_queries(request_text: str, llm=gemini, enabled=None) -> list:
     return plan
 
 
+# ---------------------------------------------------------------- قنوات تيليجرام
+
+CHANNELS = [c.strip().lstrip("@") for c in os.environ.get("TELEGRAM_CHANNELS", "shopper_ar1").split(",") if c.strip()]
+CHANNEL_MAX_AGE_DAYS = int(os.environ.get("CHANNEL_MAX_AGE_DAYS", "120"))  # العروض القديمة غالباً انتهت
+CHANNEL_PRICE_RE = re.compile(r"(?:تصير|ويصير|يصير|تصبح|بسعر|السعر)\s*(?:ب|بـ)?\s*([\d٠-٩][\d٠-٩,.]*)\s*(?:ريال|ر\.س|SAR)?", re.I)
+CHANNEL_ANY_PRICE_RE = re.compile(r"([\d٠-٩][\d٠-٩,.]*)\s*(?:ريال|ر\.س|SAR)", re.I)
+CHANNEL_CODE_RE = re.compile(r"كود(?:\s*خصم)?\s+([A-Za-z0-9]{4,})")
+
+
+def _html_text(fragment: str) -> str:
+    import html as _h
+    t = re.sub(r"<br\s*/?>", "\n", fragment)
+    t = re.sub(r"<[^>]+>", "", t)
+    return _h.unescape(t).strip()
+
+
+def parse_channel_page(html_page: str, channel: str) -> list:
+    """منشورات صفحة المعاينة العامة للقناة (t.me/s/...)."""
+    posts = []
+    for block in html_page.split('class="tgme_widget_message_wrap')[1:]:
+        post_id = re.search(r'data-post="([^"]+)"', block)
+        text_m = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', block, re.S)
+        if not post_id or not text_m:
+            continue
+        links = re.findall(r'href="(https?://(?!t\.me)[^"]+)"', text_m.group(1))
+        date_m = re.search(r'<time[^>]*datetime="([^"]+)"', block)
+        posts.append({
+            "post": f"https://t.me/{post_id.group(1)}",
+            "text": _html_text(text_m.group(1)),
+            "link": links[0] if links else "",
+            "date": date_m.group(1) if date_m else "",
+        })
+    return posts
+
+
+def channel_candidates(channel: str, terms: dict, get=None) -> list:
+    """يبحث في القناة ويحوّل المنشورات اللي فيها سعر نهائي لخيارات."""
+    get = get or (lambda url: requests.get(url, headers=BROWSER_HEADERS, timeout=20))
+    from urllib.parse import quote
+    queries = []
+    for lang in ("ar", "en"):
+        words = (terms.get(lang) or "").split()
+        for q in (" ".join(words[:3]), " ".join(words[:2])):
+            if q and q not in queries:
+                queries.append(q)
+    seen, out = set(), []
+    cutoff = _now() - timedelta(days=CHANNEL_MAX_AGE_DAYS)
+    for q in queries[:4]:
+        try:
+            r = get(f"https://t.me/s/{channel}?q={quote(q)}")
+            if r.status_code != 200:
+                continue
+            posts = parse_channel_page(r.text, channel)
+        except Exception as exc:
+            print(f"channel {channel} failed: {type(exc).__name__}", file=sys.stderr)
+            continue
+        for p in posts:
+            if p["post"] in seen or not p["link"]:
+                continue
+            seen.add(p["post"])
+            try:
+                if p["date"] and datetime.fromisoformat(p["date"]) < cutoff:
+                    continue  # عرض قديم
+            except ValueError:
+                pass
+            text = p["text"].translate(AR_DIGITS)
+            m = CHANNEL_PRICE_RE.search(text) or None
+            prices = [m.group(1)] if m else CHANNEL_ANY_PRICE_RE.findall(text)[-1:]
+            price = _num(prices[0]) if prices else None
+            if not price:
+                continue
+            first = re.split(r"[\n.،]", p["text"].strip())[0][:110]
+            codes = list(dict.fromkeys(CHANNEL_CODE_RE.findall(text)))[:3]
+            day = p["date"][:10]
+            out.append({
+                "name": first, "price_sar": price, "url": p["link"], "post": p["post"],
+                "platform": f"قناة {channel}",
+                "seller": re.sub(r"^https?://(www\.)?([^/]+).*$", r"\2", p["link"]),
+                "location": "شحن من السعودية" if "من السعودية" in p["text"] else "غير مذكور",
+                "condition": "جديد", "vat": "غير مذكور", "shipping": "غير مذكور",
+                "import_fees": "غير مذكور", "coupon": " ثم ".join(codes),
+                "price_note": f"سعر العرض في القناة بعد الأكواد، بتاريخ {day}، تأكد إنه ما انتهى",
+                "content": p["text"][:600],
+            })
+    print(f"channel {channel}: queries={len(queries[:4])} offers={len(out)}", flush=True)
+    return out
+
+
 def research(request_text: str, sources=None, llm=gemini, search=tavily, extract=tavily_extract,
              fetch=None) -> dict:
     t0 = time.time()
     today = datetime.now(KSA).strftime("%Y-%m-%d")
-    plan = plan_queries(request_text, llm, sources)
+    terms = product_terms(request_text, llm)
+    plan = plan_queries(request_text, llm, sources, terms)
     print(f"queries={len(plan)}")
 
     per_source = {}
@@ -542,6 +634,16 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
         })
     print(f"direct={len(direct)}", flush=True)
     verified = verify_options(request_text, direct, page_text, llm, cfetch, page_full) if direct else []
+
+    # عروض قنوات تيليجرام (أسعارها من المنشور نفسه، فما نفتح صفحة المتجر)
+    for channel in CHANNELS:
+        if sources is not None and f"قناة {channel}" not in sources:
+            continue
+        offers = channel_candidates(channel, terms)
+        for o in offers:
+            page_text[o["url"]] = o.pop("content")
+        if offers:
+            verified += verify_options(request_text, offers, page_text, llm, lambda u: {}, {})
     fetch = cfetch
 
     # نقسم النتائج دفعات صغيرة: الطلبات الكبيرة تطلع "النموذج مشغول" (503) كثير في الطبقة المجانية،
@@ -831,6 +933,8 @@ def format_report(request_text: str, result: dict) -> str:
             lines.append(f"💬 {o['opinion']}")
         if o.get("url"):
             lines.append(o["url"])
+        if o.get("post"):
+            lines.append(f"المنشور: {o['post']}")
         lines.append("")
 
     if len(options) < MAX_OPTIONS:
@@ -999,7 +1103,7 @@ def check_watches(tg, state, fetch=None, now=None) -> int:
 
 # ---------------------------------------------------------------- المحادثة
 
-SOURCE_NAMES = [name for name, _, _ in SOURCES]
+SOURCE_NAMES = [name for name, _, _ in SOURCES] + [f"قناة {c}" for c in CHANNELS]
 SESSION_IDLE = timedelta(minutes=int(os.environ.get("SESSION_IDLE_MIN", "10")))
 SESSION_MAX = timedelta(minutes=int(os.environ.get("SESSION_MAX_MIN", "15")))
 URL_RE = re.compile(r"https?://\S+")
@@ -1018,8 +1122,10 @@ MENU = (
 )
 
 DESCRIBE_PROMPT = """{what}
-استخرج المنتج كطلب شراء قصير للبحث: النوع، الماركة، الموديل، وأهم المواصفات الظاهرة.
-رجّع JSON فقط: {{"request": "..."}}"""
+حدد المنتج بدقة كطلب شراء قصير للبحث: النوع، الماركة، الموديل، وأهم المواصفات.
+- اقرأ أي كتابة أو شعار أو رقم موديل ظاهر على المنتج أو العلبة، واعتمد عليه أولاً.
+- لا تخمّن ماركة أو موديل غير ظاهر؛ إذا ما تأكدت اكتب النوع والمواصفات الظاهرة بس.
+رجّع JSON فقط: {{"request": "...", "sure": true}}"""
 
 
 def norm(text: str) -> str:
@@ -1152,7 +1258,7 @@ def handle_message(tg, state, msg: dict, research_fn=research, fetch=None, llm=g
         if not req:
             tg.send("ما قدرت أتعرف على المنتج من الصورة. اكتب اسمه أو أرسل رابطه.")
             return False
-        tg.send(f"المنتج: {req}")
+        tg.send(f"المنتج اللي فهمته من الصورة: {req}\n(إذا مو صحيح، أرسل 3 بعد التقرير وعدّل الطلب، أو اكتب اسمه مع الصورة)")
         do_search(tg, state, f"{req} {text}".strip(), research_fn)
         return True
 
