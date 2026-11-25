@@ -496,11 +496,12 @@ def channel_candidates(channel: str, terms: dict, get=None) -> list:
     from urllib.parse import quote
     # بحث تيليجرام يطابق الكلمات حرفياً، فنبحث بكلمات مفردة مميزة (الموديل والماركة) بدل الجملة كاملة
     generic = {"سماعة", "سماعات", "جهاز", "اصلي", "أصلي", "جديد", "لاسلكية", "wireless", "with", "for", "and",
-               "the", "new", "original", "earbuds", "headphones", "price", "سعر"}
+               "the", "new", "original", "earbuds", "headphones", "price", "سعر", "pro", "max", "plus", "ultra",
+               "mini", "lite", "روبوت", "شاشة", "جوال"}
     words = []
     for lang in ("en", "ar"):
         for w in re.findall(r"[\w\-]+", terms.get(lang) or ""):
-            if len(w) >= 3 and w.lower() not in generic and not w.isdigit() and w.lower() not in [x.lower() for x in words]:
+            if (len(w) >= 3 or re.search(r"\d", w) and re.search(r"[A-Za-z]", w)) and w.lower() not in generic and not w.isdigit() and w.lower() not in [x.lower() for x in words]:
                 words.append(w)
     queries = words[:5]
     seen, out, found = set(), [], 0
@@ -533,7 +534,12 @@ def channel_candidates(channel: str, terms: dict, get=None) -> list:
             price = _num(prices[0]) if prices else None
             if not price:
                 continue
-            first = re.split(r"[\n.،]", p["text"].strip())[0][:110]
+            # الاسم: مقطع من المنشور يبدأ من أول كلمة مطابقة (الماركة/الموديل) بدل أول سطر عام
+            flat = re.sub(r"\s+", " ", p["text"]).strip()
+            latin = [w for w in words if re.search(r"[A-Za-z]", w)] or words
+            hits = [flat.lower().find(w.lower()) for w in latin if w.lower() in flat.lower()]
+            start = min(hits) if hits else 0
+            first = flat[start:start + 60].rsplit(" ", 1)[0] if len(flat) > start + 60 else flat[start:]
             codes = list(dict.fromkeys(CHANNEL_CODE_RE.findall(text)))[:3]
             day = p["date"][:10]
             out.append({
