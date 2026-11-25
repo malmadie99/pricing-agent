@@ -632,7 +632,7 @@ def test_channel_candidates_parse_price_codes_and_skip_old():
     recent = (agent._now() - timedelta(days=10)).isoformat()
     page = CHANNEL_HTML.replace("DATE", recent)
     get = lambda url: _Resp(200, text=page)
-    out = agent.channel_candidates("shopper_ar1", {"ar": "سماعة هواوي فري بودز", "en": "huawei freebuds pro"}, get=get)
+    out = agent.channel_candidates("shopper_ar1", {"ar": "سماعة هواوي فري بودز", "en": "Huawei FreeBuds Pro 5"}, get=get)
     assert len(out) == 1
     o = out[0]
     assert o["price_sar"] == 666 and o["coupon"] == "MGDE115" and o["post"] == "https://t.me/shopper_ar1/900"

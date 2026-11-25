@@ -494,15 +494,18 @@ def channel_candidates(channel: str, terms: dict, get=None) -> list:
     """يبحث في القناة ويحوّل المنشورات اللي فيها سعر نهائي لخيارات."""
     get = get or (lambda url: requests.get(url, headers=BROWSER_HEADERS, timeout=20))
     from urllib.parse import quote
-    queries = []
-    for lang in ("ar", "en"):
-        words = (terms.get(lang) or "").split()
-        for q in (" ".join(words[:3]), " ".join(words[:2])):
-            if q and q not in queries:
-                queries.append(q)
+    # بحث تيليجرام يطابق الكلمات حرفياً، فنبحث بكلمات مفردة مميزة (الموديل والماركة) بدل الجملة كاملة
+    generic = {"سماعة", "سماعات", "جهاز", "اصلي", "أصلي", "جديد", "لاسلكية", "wireless", "with", "for", "and",
+               "the", "new", "original", "earbuds", "headphones", "price", "سعر"}
+    words = []
+    for lang in ("en", "ar"):
+        for w in re.findall(r"[\w\-]+", terms.get(lang) or ""):
+            if len(w) >= 3 and w.lower() not in generic and not w.isdigit() and w.lower() not in [x.lower() for x in words]:
+                words.append(w)
+    queries = words[:5]
     seen, out, found = set(), [], 0
     cutoff = _now() - timedelta(days=CHANNEL_MAX_AGE_DAYS)
-    for q in queries[:4]:
+    for q in queries:
         try:
             r = get(f"https://t.me/s/{channel}?q={quote(q)}")
             if r.status_code != 200:
@@ -522,6 +525,9 @@ def channel_candidates(channel: str, terms: dict, get=None) -> list:
             except ValueError:
                 pass
             text = p["text"].translate(AR_DIGITS)
+            score = sum(1 for w in words if w.lower() in text.lower())
+            if score < min(2, len(words)):
+                continue  # المنشور ما يخص المنتج المطلوب
             m = CHANNEL_PRICE_RE.search(text) or None
             prices = [m.group(1)] if m else CHANNEL_ANY_PRICE_RE.findall(text)[-1:]
             price = _num(prices[0]) if prices else None
@@ -538,9 +544,10 @@ def channel_candidates(channel: str, terms: dict, get=None) -> list:
                 "condition": "جديد", "vat": "غير مذكور", "shipping": "غير مذكور",
                 "import_fees": "غير مذكور", "coupon": " ثم ".join(codes),
                 "price_note": f"سعر العرض في القناة بعد الأكواد، بتاريخ {day}، تأكد إنه ما انتهى",
-                "content": p["text"][:600],
+                "content": p["text"][:600], "_score": score,
             })
-    print(f"channel {channel}: queries={len(queries[:4])} posts={found} offers={len(out)}", flush=True)
+    out = sorted(out, key=lambda o: -o.pop("_score"))[:10]
+    print(f"channel {channel}: queries={queries} posts={found} offers={len(out)}", flush=True)
     return out
 
 
