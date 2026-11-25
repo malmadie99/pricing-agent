@@ -591,3 +591,29 @@ def test_price_found_in_opened_page_counts_as_verified():
     out = agent.verify_options("ايربودز برو 2", opts, {}, llm=lambda p, s="": '{"checks":[]}',
                                fetch=lambda u: {}, page_full={"https://www.amazon.sa/dp/X": "AirPods Pro 2 SAR 569.00 Add to cart"})
     assert out and out[0]["price_verified"]
+
+
+class _Resp:
+    def __init__(self, code, data=None, text=""):
+        self.status_code, self._data, self.text, self.url = code, data or {}, text, "https://x/y"
+    def json(self):
+        return self._data
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise agent.requests.HTTPError(str(self.status_code), response=self)
+
+
+def test_gemini_busy_switches_to_groq(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k"); monkeypatch.setenv("GROQ_API_KEY", "g")
+    monkeypatch.setattr(agent, "_MODELS_CACHE", ["gemini-a", "gemini-b"]); monkeypatch.setattr(agent, "_BUSY", {})
+    monkeypatch.setattr(agent, "_DEAD_MODELS", set()); monkeypatch.setattr(agent, "_GROQ_MODELS", ["gpt-oss-120b"])
+    monkeypatch.setattr(agent.time, "sleep", lambda s: None)
+    posts = []
+    def post(url, headers=None, json=None, timeout=None):
+        posts.append(url)
+        if "groq" in url:
+            return _Resp(200, {"choices": [{"message": {"content": '{"ok": 1}'}}]})
+        return _Resp(503, text="busy")
+    monkeypatch.setattr(agent.requests, "post", post)
+    assert agent.gemini("hi") == '{"ok": 1}'
+    assert any("groq" in p for p in posts) and sum("gemini-b" in p for p in posts) == 0

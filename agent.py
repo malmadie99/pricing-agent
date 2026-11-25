@@ -254,6 +254,55 @@ def gemini_models() -> list:
     return free + busy
 
 
+_GROQ_MODELS = None
+GROQ_PREFERRED = ["gpt-oss-120b", "llama-3.3-70b", "llama-4-maverick", "qwen3", "kimi-k2", "gpt-oss-20b",
+                  "llama-4-scout", "llama-3.1-8b"]
+
+
+def groq_models() -> list:
+    """نماذج Groq المتاحة على المفتاح، بترتيب الأفضلية."""
+    global _GROQ_MODELS
+    if _GROQ_MODELS is None:
+        names = []
+        try:
+            r = requests.get("https://api.groq.com/openai/v1/models",
+                             headers={"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}"}, timeout=30)
+            r.raise_for_status()
+            names = [m["id"] for m in r.json().get("data", [])
+                     if not re.search(r"whisper|guard|tts|playai|orpheus|compound|prompt", m["id"], re.I)]
+        except Exception as exc:
+            print(f"groq model list failed: {type(exc).__name__}", file=sys.stderr)
+        rank = lambda n: next((i for i, p in enumerate(GROQ_PREFERRED) if p in n), len(GROQ_PREFERRED))
+        _GROQ_MODELS = sorted(names, key=rank)[:3]
+        print(f"groq models: {_GROQ_MODELS}", flush=True)
+    return _GROQ_MODELS
+
+
+def groq(prompt: str, system: str = "", json_mode: bool = True) -> str:
+    """مزوّد ثاني مجاني وسريع، نستخدمه لما Gemini يزحم."""
+    headers = {"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}"}
+    messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
+    last = None
+    for model in groq_models():
+        body = {"model": model, "messages": messages, "temperature": 0.2}
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        started = time.time()
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=body, timeout=90)
+        if r.status_code == 400 and json_mode and "json" in r.text.lower():
+            body.pop("response_format")  # بعض النماذج ما تدعم وضع JSON
+            r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=body, timeout=90)
+        print(f"groq {model} {r.status_code} {time.time() - started:.0f}s", flush=True)
+        last = r
+        if r.status_code in (404, 413, 429, 500, 502, 503, 504):
+            continue
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"] or ""
+    if last is not None:
+        last.raise_for_status()
+    raise requests.ConnectionError("no groq models")
+
+
 def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) -> str:
     parts = [{"text": prompt}]
     if image:  # (bytes, mime)
@@ -269,10 +318,16 @@ def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) ->
         body["generationConfig"]["responseMimeType"] = "application/json"
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
 
-    last, busy_streak = None, 0
+    last, busy_streak, tried_groq = None, 0, False
     for model in gemini_models():
         if busy_streak >= 4:
             break  # Google مزدحم على كل النماذج، ما نضيع وقت أكثر
+        if busy_streak >= 1 and not tried_groq and not image and os.environ.get("GROQ_API_KEY"):
+            tried_groq = True  # Gemini زحم: نجرب Groq قبل باقي نماذج Gemini
+            try:
+                return groq(prompt, system, json_mode)
+            except Exception as exc:
+                print(f"groq failed: {type(exc).__name__}", file=sys.stderr, flush=True)
         url = GEMINI_URL.format(model=model)
         payload = body
         if model.startswith("gemma"):  # Gemma ما يدعم تعليمات النظام ولا وضع JSON
@@ -294,6 +349,7 @@ def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) ->
         last = r
         if r.status_code in (404, 429):
             _DEAD_MODELS.add(model)  # ما نضيع وقت عليه مرة ثانية في هالتشغيلة
+            busy_streak += 1 if r.status_code == 429 else 0
             continue
         if r.status_code in (500, 502, 503, 504):
             _BUSY[model] = time.time()
@@ -303,6 +359,8 @@ def gemini(prompt: str, system: str = "", json_mode: bool = True, image=None) ->
         r.raise_for_status()
         parts = r.json()["candidates"][0]["content"]["parts"]
         return "".join(p.get("text", "") for p in parts if not p.get("thought"))
+    if not tried_groq and not image and os.environ.get("GROQ_API_KEY"):
+        return groq(prompt, system, json_mode)
     last.raise_for_status()
 
 
