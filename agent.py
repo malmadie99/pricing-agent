@@ -1462,6 +1462,8 @@ def main():
     tg = Telegram(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])
     me = tg.call("getMe")
     print(f"bot=@{me.get('username')}")  # للتأكد إن التوكن حق البوت الصحيح
+    if os.environ.get("GROQ_API_KEY"):
+        groq_models()  # يتأكد إن مفتاح Groq شغال ويطبع النماذج المتاحة
     hook = tg.call("getWebhookInfo")
     print(f"webhook_set={bool(hook.get('url'))} pending={hook.get('pending_update_count')}")
     if hook.get("url"):
