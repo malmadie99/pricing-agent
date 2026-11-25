@@ -458,7 +458,7 @@ def plan_queries(request_text: str, llm=gemini, enabled=None, terms=None) -> lis
 # ---------------------------------------------------------------- قنوات تيليجرام
 
 CHANNELS = [c.strip().lstrip("@") for c in os.environ.get("TELEGRAM_CHANNELS", "shopper_ar1").split(",") if c.strip()]
-CHANNEL_MAX_AGE_DAYS = int(os.environ.get("CHANNEL_MAX_AGE_DAYS", "120"))  # العروض القديمة غالباً انتهت
+CHANNEL_MAX_AGE_DAYS = int(os.environ.get("CHANNEL_MAX_AGE_DAYS", "365"))  # أقدم من سنة غالباً انتهى
 CHANNEL_PRICE_RE = re.compile(r"(?:تصير|ويصير|يصير|تصبح|بسعر|السعر)\s*(?:ب|بـ)?\s*([\d٠-٩][\d٠-٩,.]*)\s*(?:ريال|ر\.س|SAR)?", re.I)
 CHANNEL_ANY_PRICE_RE = re.compile(r"([\d٠-٩][\d٠-٩,.]*)\s*(?:ريال|ر\.س|SAR)", re.I)
 CHANNEL_CODE_RE = re.compile(r"كود(?:\s*خصم)?\s+([A-Za-z0-9]{4,})")
@@ -500,7 +500,7 @@ def channel_candidates(channel: str, terms: dict, get=None) -> list:
         for q in (" ".join(words[:3]), " ".join(words[:2])):
             if q and q not in queries:
                 queries.append(q)
-    seen, out = set(), []
+    seen, out, found = set(), [], 0
     cutoff = _now() - timedelta(days=CHANNEL_MAX_AGE_DAYS)
     for q in queries[:4]:
         try:
@@ -508,6 +508,7 @@ def channel_candidates(channel: str, terms: dict, get=None) -> list:
             if r.status_code != 200:
                 continue
             posts = parse_channel_page(r.text, channel)
+            found += len(posts)
         except Exception as exc:
             print(f"channel {channel} failed: {type(exc).__name__}", file=sys.stderr)
             continue
@@ -539,7 +540,7 @@ def channel_candidates(channel: str, terms: dict, get=None) -> list:
                 "price_note": f"سعر العرض في القناة بعد الأكواد، بتاريخ {day}، تأكد إنه ما انتهى",
                 "content": p["text"][:600],
             })
-    print(f"channel {channel}: queries={len(queries[:4])} offers={len(out)}", flush=True)
+    print(f"channel {channel}: queries={len(queries[:4])} posts={found} offers={len(out)}", flush=True)
     return out
 
 
@@ -705,6 +706,7 @@ VERIFY_PROMPT = """طلب الشراء: {request}
 تحت قائمة منتجات مرشحة مع نص من صفحاتها. لكل منتج قرر بصرامة:
 - complete: هل هو الجهاز/المنتج الكامل نفسه المطلوب؟ (false إذا كان قطع غيار، شمعات، فلاتر بديلة، ملحقات، هيكل لحاله، أو طقم مستهلكات)
 - matches: false إذا الطلب يحدد ماركة أو موديل والمنتج ماركة ثانية أو بدون ماركة (OEM / ODM / generic / compatible). وكذلك false إذا الاسم أو الصفحة تذكر رقم يخالف الطلب صراحة (مثلاً مرحلتين بدل 3، أو 10 انش بدل 20). إذا المواصفة غير مذكورة اعتبرها true.
+- condition: "جديد" أو "مستعمل" حسب الصفحة (إعلانات حراج غالباً مستعمل إلا إذا مكتوب جديد).
 - genuine: false إذا الصفحة تقول إنه تقليد أو "طبق الأصل" أو "هاي كوبي" أو "ماستر كوبي"، أو إذا السعر أقل بكثير من سعر السوق المعروف لماركة أصلية (مثلاً سماعة أبل أصلية بأقل من نص سعرها). غير كذا true.
 - opinion: سطر واحد قصير بالسعودي، رأي استشاري بحت عن ميزة المنتج أو سعره، بدون توصية.
 رجّع JSON فقط: {{"checks": [{{"i": 0, "complete": true, "matches": true, "genuine": true, "opinion": "..."}}]}}
@@ -777,6 +779,8 @@ def fetch_structured(url: str) -> dict:
         r = requests.get(url, headers=BROWSER_HEADERS, timeout=15)
         if r.status_code != 200:
             return {}
+        if not r.encoding or r.encoding.lower() in ("iso-8859-1", "latin-1", "ascii"):
+            r.encoding = "utf-8"  # بعض المواقع ما تحدد الترميز، فيطلع العربي رموز غريبة
         return parse_structured_price(r.text)
     except requests.RequestException:
         return {}
@@ -855,6 +859,8 @@ def verify_options(request_text, options, page_text, llm=gemini, fetch=None, pag
                 for i, o in enumerate(checked):
                     if not o.get("opinion") and isinstance(verdict.get(i, {}).get("opinion"), str):
                         o["opinion"] = verdict[i]["opinion"].strip()
+                    if verdict.get(i, {}).get("condition") in ("جديد", "مستعمل"):
+                        o["condition"] = verdict[i]["condition"]
                 checked = [o for i, o in enumerate(checked)
                            if verdict.get(i, {}).get("complete") and verdict.get(i, {}).get("matches")
                            and verdict.get(i, {}).get("genuine", True) is not False]
