@@ -584,3 +584,10 @@ def test_knockoff_and_duplicates():
         {"name": "Apple AirPods Pro 2 Wireless Earbuds", "price_sar": 569, "platform": "أمازون", "url": "u2"},
         {"name": "Apple AirPods Pro 2", "price_sar": 799, "platform": "نون", "url": "u3"}]}
     assert [o["url"] for o in agent.display_options(r)] == ["u1", "u3"]
+
+
+def test_price_found_in_opened_page_counts_as_verified():
+    opts = [{"name": "AirPods Pro 2", "price_sar": 569, "url": "https://www.amazon.sa/dp/X"}]
+    out = agent.verify_options("ايربودز برو 2", opts, {}, llm=lambda p, s="": '{"checks":[]}',
+                               fetch=lambda u: {}, page_full={"https://www.amazon.sa/dp/X": "AirPods Pro 2 SAR 569.00 Add to cart"})
+    assert out and out[0]["price_verified"]

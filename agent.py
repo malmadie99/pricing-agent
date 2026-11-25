@@ -189,7 +189,7 @@ UNAVAILABLE_RE = re.compile(
     r"نفدت الكمية|نفذت الكمية|غير متوفر حالي|المنتج غير متوفر|مزايدة|مزاد|محذوف أو قديم|الإعلان محذوف",
     re.I,
 )
-MAX_PAGES = int(os.environ.get("MAX_PAGES", "20"))  # كل 5 صفحات = رصيد واحد من Tavily
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "25"))  # كل 5 صفحات = رصيد واحد من Tavily
 PRICE_RE = re.compile(r"(?:SAR|SR|ر\.?\s?س|ريال)\s*[\d٠-٩][\d٠-٩,.]*|[\d٠-٩][\d٠-٩,.]*\s*(?:SAR|SR|ر\.?\s?س|ريال)", re.I)
 
 QUERY_PROMPT = """حوّل طلب الشراء التالي لعبارتي بحث قصيرة عن المنتج نفسه (اسم المنتج وأهم مواصفاته فقط، بدون الميزانية):
@@ -454,6 +454,7 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
 
     system = SYSTEM_PROMPT.replace("MAX_OPTIONS", "8")
     page_text = {r["url"]: r.get("page") or r.get("content", "") for r in results}
+    page_full = {u: re.sub(r"\s+", " ", t)[:20000] for u, t in pages.items()}  # نص الصفحة نفسها (مو ملخص البحث)
 
     # 1) مرشحين مباشرين من البيانات المنظمة في صفحات المنتجات: سعر رسمي ومتوفر، بدون ما نحتاج Gemini.
     cache = {}
@@ -482,7 +483,7 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
             "vat": "غير مذكور", "shipping": "غير مذكور", "import_fees": "لا يوجد" if saudi else "محتمل",
         })
     print(f"direct={len(direct)}", flush=True)
-    verified = verify_options(request_text, direct, page_text, llm, cfetch) if direct else []
+    verified = verify_options(request_text, direct, page_text, llm, cfetch, page_full) if direct else []
     fetch = cfetch
 
     # نقسم النتائج دفعات صغيرة: الطلبات الكبيرة تطلع "النموذج مشغول" (503) كثير في الطبقة المجانية،
@@ -515,7 +516,7 @@ def research(request_text: str, sources=None, llm=gemini, search=tavily, extract
         seen_urls.update(o["url"] for o in options)
         print(f"chunk={k // CHUNK} options={len(options)}", flush=True)
         if options:
-            verified += verify_options(request_text, options, page_text, llm, fetch)
+            verified += verify_options(request_text, options, page_text, llm, fetch, page_full)
         if len(verified) >= MAX_OPTIONS:
             break
 
@@ -646,7 +647,8 @@ def is_part(name: str, request_text: str) -> bool:
     return any(w in name and w not in req for w in PART_WORDS)
 
 
-def verify_options(request_text, options, page_text, llm=gemini, fetch=None) -> list:
+def verify_options(request_text, options, page_text, llm=gemini, fetch=None, page_full=None) -> list:
+    page_full = page_full or {}
     fetch = fetch or fetch_structured
     # 1) استبعاد القطع والمستهلكات من الاسم
     before = len(options)
@@ -663,9 +665,12 @@ def verify_options(request_text, options, page_text, llm=gemini, fetch=None) -> 
         if sd.get("available") is False:
             oos += 1
             continue  # نافد حسب الصفحة
-        if not sd.get("price") and not price_in_text(o.get("price_sar"), page_text.get(o.get("url"), "")):
+        in_page = price_in_text(o.get("price_sar"), page_full.get(o.get("url"), ""))
+        if not sd.get("price") and not in_page and not price_in_text(o.get("price_sar"), page_text.get(o.get("url"), "")):
             unpriced += 1
             continue  # سعر ما نقدر نتحقق منه ولا هو مكتوب في الصفحة = ممكن يكون تقدير، نستبعده
+        if not sd.get("price") and in_page:
+            o["price_verified"] = True  # الرقم مكتوب في نص صفحة المنتج اللي فتحناها
         if sd.get("price"):
             cur = sd.get("currency") or "SAR"
             rate = CURRENCY_TO_SAR.get(cur)
